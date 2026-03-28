@@ -1,0 +1,10 @@
+#!/bin/sh
+. "$(dirname "$0")/_poc_lib.sh"
+TARGET="${AXS_TARGET:-${1:-}}"
+EXTRA="${AXS_EXTRA:-${2:-}}"
+echo "PoC: PLACEHOLDER ($0)"
+echo "Target: $TARGET"
+echo "Extra: $EXTRA"
+echo "Mode: DRY-RUN"
+poc_result "SIMULATED" 0.1 "placeholder PoC: implement specifics"
+exit 0

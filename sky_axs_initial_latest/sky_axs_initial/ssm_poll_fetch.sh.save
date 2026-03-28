@@ -1,0 +1,139 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Usage:
+# ./create_and_attach_role.sh --region eu-north-1 --role sky-axs-ec2-ssm-role \
+#   --instance-profile sky-axs-ec2-instance-profile --instance i-073815d079f010ce6 \
+#   --bucket my-sky-axs-bucket-yourname --auto yes
+
+REGION="eu-north-1"
+ROLE_NAME="sky-axs-ec2-ssm-role"
+INSTANCE_PROFILE_NAME="sky-axs-ec2-instance-profile"
+INSTANCE_ID=""
+BUCKET="my-sky-axs-bucket-yourname"
+AUTO="yes"   # yes=apply changes, no=just report
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --region) REGION="$2"; shift 2;;
+    --role) ROLE_NAME="$2"; shift 2;;
+    --instance-profile) INSTANCE_PROFILE_NAME="$2"; shift 2;;
+    --instance) INSTANCE_ID="$2"; shift 2;;
+    --bucket) BUCKET="$2"; shift 2;;
+    --auto) AUTO="$2"; shift 2;;
+    -h|--help) echo "Usage: $0 --region R --role RNAME --instance-profile IP --instance IID --bucket B --auto yes|no"; exit 0;;
+    *) echo "Unknown: $1"; exit 1;;
+  esac
+done
+
+if [ -z "$INSTANCE_ID" ]; then
+  echo "ERROR: pass --instance <instance-id>"
+  exit 1
+fi
+
+echo "[*] Using region=$REGION role=$ROLE_NAME instance_profile=$INSTANCE_PROFILE_NAME instance=$INSTANCE_ID bucket=$BUCKET auto=$AUTO"
+
+# 1) create role if not exists (trust policy for EC2)
+if aws iam get-role --role-name "$ROLE_NAME" --output json >/dev/null 2>&1; then
+  echo "[*] Role $ROLE_NAME already exists."
+else
+  echo "[*] Creating IAM role $ROLE_NAME (trust policy: ec2.amazonaws.com)"
+  read -r -d '' TRUST <<'JSON' || true
+{
+  "Version":"2012-10-17",
+  "Statement":[
+    {
+      "Effect":"Allow",
+      "Principal":{"Service":["ec2.amazonaws.com"]},
+      "Action":"sts:AssumeRole"
+    }
+  ]
+}
+JSON
+  aws iam create-role --role-name "$ROLE_NAME" --assume-role-policy-document "$TRUST" --description "Role for SkyAXS EC2 nodes (SSM + S3 access)" || { echo "FAILED create-role"; exit 1; }
+fi
+
+# 2) Attach AWS managed policy for SSM (so instance is SSM-managed)
+if aws iam list-attached-role-policies --role-name "$ROLE_NAME" --query "AttachedPolicies[?PolicyName=='AmazonSSMManagedInstanceCore']" --output text | grep -q "arn:"; then
+  echo "[*] AmazonSSMManagedInstanceCore already attached"
+else
+  echo "[*] Attaching AmazonSSMManagedInstanceCore to $ROLE_NAME"
+  aws iam attach-role-policy --role-name "$ROLE_NAME" --policy-arn arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+fi
+
+# 3) Attach CloudWatchAgentServerPolicy (optional) - skip if you don't want
+if aws iam list-attached-role-policies --role-name "$ROLE_NAME" --query "AttachedPolicies[?PolicyName=='CloudWatchAgentServerPolicy']" --output text | grep -q "arn:"; then
+  echo "[*] CloudWatchAgentServerPolicy already attached"
+else
+  echo "[*] Attaching CloudWatchAgentServerPolicy to $ROLE_NAME"
+  aws iam attach-role-policy --role-name "$ROLE_NAME" --policy-arn arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy || true
+fi
+
+# 4) Add inline S3 policy (minimal) to role so instance can read/write bucket objects
+read -r -d '' S3POL <<JSON || true
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "AllowListBucket",
+      "Effect": "Allow",
+      "Action": ["s3:ListBucket","s3:GetBucketLocation"],
+      "Resource": "arn:aws:s3:::$BUCKET"
+    },
+    {
+      "Sid": "AllowGetPutHead",
+      "Effect": "Allow",
+      "Action": ["s3:GetObject","s3:PutObject","s3:HeadObject"],
+      "Resource": "arn:aws:s3:::$BUCKET/*"
+    }
+  ]
+}
+JSON
+
+echo "[*] Putting inline role policy SkyAxsS3Access (idempotent)..."
+aws iam put-role-policy --role-name "$ROLE_NAME" --policy-name SkyAxsS3Access --policy-document "$S3POL"
+
+# 5) ensure instance profile exists and has the role
+if aws iam get-instance-profile --instance-profile-name "$INSTANCE_PROFILE_NAME" --output json >/dev/null 2>&1; then
+  echo "[*] Instance profile $INSTANCE_PROFILE_NAME exists"
+else
+  echo "[*] Creating instance profile $INSTANCE_PROFILE_NAME"
+  aws iam create-instance-profile --instance-profile-name "$INSTANCE_PROFILE_NAME"
+fi
+
+# add role to instance profile (idempotent: if already attached will error but we ignore)
+if aws iam get-instance-profile --instance-profile-name "$INSTANCE_PROFILE_NAME" --query "InstanceProfile.Roles[?RoleName=='$ROLE_NAME']" --output text | grep -q "$ROLE_NAME"; then
+  echo "[*] Role already inside instance profile"
+else
+  echo "[*] Adding role $ROLE_NAME to instance profile $INSTANCE_PROFILE_NAME"
+  aws iam add-role-to-instance-profile --instance-profile-name "$INSTANCE_PROFILE_NAME" --role-name "$ROLE_NAME" || true
+fi
+
+# 6) Associate instance profile with EC2 instance
+CUR_PROFILE_ARN=$(aws ec2 describe-instances --region "$REGION" --instance-ids "$INSTANCE_ID" --query "Reservations[].Instances[].IamInstanceProfile.Arn" --output text || echo "")
+if [ -z "$CUR_PROFILE_ARN" ] || [ "$CUR_PROFILE_ARN" = "None" ]; then
+  echo "[*] Associating instance profile $INSTANCE_PROFILE_NAME with instance $INSTANCE_ID"
+  if [ "$AUTO" = "yes" ]; then
+    aws ec2 associate-iam-instance-profile --region "$REGION" --instance-id "$INSTANCE_ID" --iam-instance-profile Name="$INSTANCE_PROFILE_NAME"
+  else
+    echo "[DRY] aws ec2 associate-iam-instance-profile --region $REGION --instance-id $INSTANCE_ID --iam-instance-profile Name=$INSTANCE_PROFILE_NAME"
+  fi
+else
+  echo "[*] Instance already has instance profile: $CUR_PROFILE_ARN"
+fi
+
+# 7) (Optional) create bucket if not exists
+if aws s3api head-bucket --bucket "$BUCKET" --region "$REGION" 2>/dev/null; then
+  echo "[*] Bucket $BUCKET exists"
+else
+  if [ "$AUTO" = "yes" ]; then
+    echo "[*] Creating bucket $BUCKET in $REGION"
+    aws s3api create-bucket --bucket "$BUCKET" --create-bucket-configuration LocationConstraint="$REGION" --region "$REGION" || true
+  else
+    echo "[DRY] aws s3api create-bucket --bucket $BUCKET --region $REGION"
+  fi
+fi
+
+echo "[*] DONE. Verify on the instance: SSM should show the node as managed. Then run SSM SendCommand to bootstrap or start services."
+echo "Next verify: aws ssm describe-instance-information --region $REGION --query 'InstanceInformationList[?InstanceId==\"$INSTANCE_ID\"]'"
+

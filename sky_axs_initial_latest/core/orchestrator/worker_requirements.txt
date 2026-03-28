@@ -1,0 +1,10 @@
+redis
+rq
+requests
+numpy
+pandas
+joblib
+scikit-learn
+aiohttp
+tenacity
+boto3

@@ -1,0 +1,103 @@
+#!/usr/bin/env python3
+"""
+AXS Terminal UI (multi-screen) - main entrypoint
+Path: core/ui/app.py
+Run: python3 core/ui/app.py
+Requires: textual, rich, redis (optional)
+"""
+import asyncio
+from textual.app import App, ComposeResult
+from textual.widgets import Header, Footer, Static
+from textual.containers import Container
+from textual.screen import Screen
+from textual.reactive import var
+from textual.widgets import Button
+from textual import events
+
+# import screens (local)
+from core.ui.screens.dashboard import DashboardScreen
+from core.ui.screens.sandbox import SandboxScreen
+from core.ui.screens.ai_analyzer import AIAnalyzerScreen
+from core.ui.screens.system import SystemScreen
+from core.ui.screens.decision import DecisionScreen
+from core.ui.screens.logs import LogsScreen
+
+class MenuBar(Static):
+    def on_mount(self):
+        self.update(
+            "[1] 🏠 Dashboard    [2] 🧩 Sandbox    [3] 🧠 AI    [4] ⚙️ System    [5] 🔐 Decision    [6] 📜 Logs    [Q] Quit\n"
+            "Use numbers or ← → to navigate — Enter to open current"
+        )
+
+class MainApp(App):
+    CSS_PATH = None
+    BINDINGS = [("left", "prev_screen", "Previous screen"),
+                ("right", "next_screen", "Next screen"),
+                ("q", "quit", "Quit"),
+                ("1", "goto_dashboard", "Dashboard"),
+                ("2", "goto_sandbox", "Sandbox"),
+                ("3", "goto_ai", "AI Analyzer"),
+                ("4", "goto_system", "System"),
+                ("5", "goto_decision", "Decision"),
+                ("6", "goto_logs", "Logs"),
+                ("r", "refresh", "Refresh current")]
+    SCREENS = ["dashboard","sandbox","ai","system","decision","logs"]
+
+    current_index = var(0)
+
+    def compose(self) -> ComposeResult:
+        yield Header(show_clock=True)
+        yield MenuBar()
+        yield Container(id="screen_container")
+        yield Footer()
+
+    async def on_mount(self) -> None:
+        # push default screens (they are lazy loaded in their modules)
+        await self.push_screen(DashboardScreen(), name="dashboard")
+        await self.push_screen(SandboxScreen(), name="sandbox")
+        await self.push_screen(AIAnalyzerScreen(), name="ai")
+        await self.push_screen(SystemScreen(), name="system")
+        await self.push_screen(DecisionScreen(), name="decision")
+        await self.push_screen(LogsScreen(), name="logs")
+
+        # show the dashboard initially
+        await self.switch_to_screen("dashboard")
+
+    async def switch_to_screen(self, name: str):
+        # pop all to root then push target visible
+        await self.pop_screen()  # pop top
+        # ensure target is top (textual keeps stack, so we push again)
+        await self.push_screen(self.screen_stack[name], name=name) if False else None
+        await self.activate_screen(name)
+
+    async def activate_screen(self, name: str):
+        # textual app: call app.push_screen/pop_screen is already used above;
+        # simpler: use app.switch_screen
+        try:
+            await self.switch_screen(name)
+        except Exception:
+            # fallback: try to push screen
+            pass
+        self.set_status(f"Active: {name}")
+
+    def action_prev_screen(self):
+        self.current_index = (self.current_index - 1) % len(self.SCREENS)
+        asyncio.create_task(self.switch_screen(self.SCREENS[self.current_index]))
+
+    def action_next_screen(self):
+        self.current_index = (self.current_index + 1) % len(self.SCREENS)
+        asyncio.create_task(self.switch_screen(self.SCREENS[self.current_index]))
+
+    def action_goto_dashboard(self): asyncio.create_task(self.switch_screen("dashboard"))
+    def action_goto_sandbox(self):   asyncio.create_task(self.switch_screen("sandbox"))
+    def action_goto_ai(self):        asyncio.create_task(self.switch_screen("ai"))
+    def action_goto_system(self):    asyncio.create_task(self.switch_screen("system"))
+    def action_goto_decision(self):  asyncio.create_task(self.switch_screen("decision"))
+    def action_goto_logs(self):      asyncio.create_task(self.switch_screen("logs"))
+
+    def action_refresh(self):
+        # send refresh event to current screen
+        self.post_message(events.Message(self, "refresh"))
+
+if __name__ == "__main__":
+    MainApp().run()

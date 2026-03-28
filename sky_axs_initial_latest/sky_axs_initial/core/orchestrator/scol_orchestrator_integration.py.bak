@@ -1,0 +1,74 @@
+#!/usr/bin/env python3
+"""
+Simple orchestrator helper — enqueue sky jobs into RQ.
+Usage:
+  python scol_orchestrator_integration.py --target example.com [--extra "--dry-run"]
+  python scol_orchestrator_integration.py --list      # list queued jobs
+"""
+import argparse
+import os
+import sys
+from datetime import datetime
+
+try:
+    from rq import Queue
+    from redis import Redis
+except Exception as e:
+    print("Missing rq/redis packages:", e, file=sys.stderr)
+    sys.exit(2)
+
+# If core.worker is importable in container (it should be), we prefer to enqueue by function ref:
+try:
+    from core.worker.tasks import run_sky
+    HAVE_TASK = True
+except Exception:
+    HAVE_TASK = False
+
+def connect_redis(host='redis', port=6379, db=0):
+    return Redis(host=host, port=port, db=db, socket_connect_timeout=5)
+
+def main():
+    p = argparse.ArgumentParser()
+    p.add_argument('--target', '-t', help='Target (domain or ip)')
+    p.add_argument('--extra', '-e', help='Extra args to pass to sky.sh', default=None)
+    p.add_argument('--host', help='Redis host', default=os.environ.get('REDIS_HOST','redis'))
+    p.add_argument('--port', help='Redis port', default=int(os.environ.get('REDIS_PORT','6379')))
+    p.add_argument('--list', action='store_true', help='List current jobs in queue')
+    args = p.parse_args()
+
+    r = connect_redis(host=args.host, port=args.port)
+
+    q = Queue('default', connection=r)
+
+    if args.list:
+        jobs = q.jobs  # may be empty
+        print("Jobs in queue (count={}):".format(len(jobs)))
+        for j in jobs[:50]:
+        return
+
+    if not args.target:
+        p.print_help()
+        sys.exit(1)
+
+    if HAVE_TASK:
+        # enqueue using local import (recommended - worker will import same module)
+        job = q.enqueue(run_sky, args.target, args.extra)
+    else:
+        # fallback: enqueue by import path string (worker must have same module path)
+        job = q.enqueue('core.worker.tasks.run_sky', args=(args.target, args.extra))
+
+    print("Enqueued job id={} target={} extra={}".format(job.id, args.target, args.extra))
+    print("Queued at:", datetime.utcnow().isoformat() + "Z")
+    print()
+    print("To follow progress:")
+    print(" - docker-compose logs -f worker  (or `docker logs <worker-container>`)")
+    print(" - check results under the data/jobs directory on host (if mounted).")
+    print()
+    print("If you want to enqueue many targets, you can loop and call this script from outside.")
+
+    main()
+
+    main()
+
+if name == "__main__":
+    main()

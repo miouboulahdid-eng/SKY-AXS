@@ -1,0 +1,3 @@
+SKY.PLACEHOLDER
+target:example.com
+dry_run:true

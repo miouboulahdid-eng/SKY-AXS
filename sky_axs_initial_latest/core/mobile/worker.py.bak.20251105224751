@@ -1,0 +1,49 @@
+import os
+import time
+import logging
+import socket
+import redis
+from rq import Worker, Queue
+
+logging.basicConfig(level=logging.INFO, format='[Mobile Worker] %(message)s')
+
+def resolve_redis_host(host):
+    """تحقق من إمكانية ترجمة اسم Redis"""
+    try:
+        socket.gethostbyname(host)
+        return True
+    except socket.error:
+        return False
+
+def get_redis_connection():
+    """يحاول الاتصال بـ Redis حتى ينجح"""
+    redis_host = os.getenv("REDIS_HOST", "sky_axs_initial-redis")
+    redis_port = int(os.getenv("REDIS_PORT", "6379"))
+
+    for attempt in range(1, 6):  # نحاول 5 مرات
+        if not resolve_redis_host(redis_host):
+            logging.warning(f"⚠️ DNS فشل في إيجاد {redis_host}. المحاولة {attempt}/5 ...")
+            time.sleep(3)
+            continue
+
+        try:
+            conn = redis.Redis(host=redis_host, port=redis_port, decode_responses=True)
+            conn.ping()
+            logging.info(f"🚀 تم الاتصال بـ Redis في {redis_host}:{redis_port}")
+            return conn
+        except redis.ConnectionError as e:
+            logging.warning(f"❌ فشل الاتصال بـ Redis ({e}). المحاولة {attempt}/5 ...")
+            time.sleep(5)
+
+    raise ConnectionError("❌ لم يتم الاتصال بـ Redis بعد 5 محاولات.")
+
+def start_mobile_worker():
+    redis_conn = get_redis_connection()
+    queue_name = os.getenv("MOBILE_QUEUE", "mobile")
+    queue = Queue(queue_name, connection=redis_conn)
+    worker = Worker([queue])
+    logging.info(f"💼 Mobile Worker يعمل على الطابور: {queue_name}")
+    worker.work(with_scheduler=True)
+
+if __name__ == "__main__":
+    start_mobile_worker()

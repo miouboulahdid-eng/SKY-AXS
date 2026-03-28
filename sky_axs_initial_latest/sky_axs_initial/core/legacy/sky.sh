@@ -1,0 +1,802 @@
+#!/usr/bin/env bash
+export HOME="${HOME:-/root}"
+#
+# sky.sh v7.0 (corrected)
+# Recon ذكي متكامل: passive + optional active + OOB + ML/NLP + Smart Scoring + Auto-Heal + Scheduler
+# التعليقات بالعربية
+#
+# تحذير قانوني: لا تستخدم الفحص النشط أو أدوات التخمين إلا إذا كان لديك إذن صريح ومكتوب.
+set -euo pipefail
+IFS=$'\n\t'
+
+VERSION="v7.0"
+PROGNAME="$(basename "$0")"
+
+##########################
+# DEFAULT CONFIGURATION
+##########################
+OUTBASE="${PWD}/evidence"
+START_TS="$(date -u +%Y%m%dT%H%M%SZ)"
+TARGET=""
+OUTDIR=""
+LOGFILE=""
+
+DRY_RUN=false
+ACTIVE=false
+CONFIRMED=false   # requires --yes-i-have-permission
+FIX_INSTALL=false
+AUTO_HEAL=false
+
+MAX_FETCH=200
+FFUF_WORDLIST="/usr/share/wordlists/dirb/common.txt"
+FFUF_THREADS=10
+
+OOB_MODE=${OOB_MODE:-false}
+INTERACTSH_CLIENT="${HOME}/.local/bin/interactsh-client"
+
+HYDRA_MODE=${HYDRA_MODE:-false}
+HYDRA_THREADS=5
+
+OPENAI_SUMMARIZE=false
+OPENAI_API_KEY="${OPENAI_API_KEY:-}"
+OPENAI_MODEL="${OPENAI_MODEL:-gpt-4o-mini}"
+
+SKY_DB="${HOME}/.sky_sh/db"
+UPD_LOG="${HOME}/.sky_sh/update.log"
+
+REQUIRED_TOOLS=(curl jq openssl dig whois zip unzip sha256sum awk sed grep xxd tput)
+OPTIONAL_TOOLS=(ffuf nuclei nmap hydra tcpdump interactsh-client python3 pip3)
+
+EXCLUDE_PATTERN=""
+
+##########################
+# HELP / USAGE
+##########################
+usage(){
+cat <<EOF
+$PROGNAME $VERSION
+Usage: $PROGNAME -t target [options]
+
+Required:
+  -t, --target TARGET        Target domain (e.g. example.com)
+
+General:
+  --dry-run                  Simulate (no network actions)
+  --outbase PATH             Base output dir (default: ./evidence)
+  --exclude "A,B"            Exclude subdomains/URLs containing keywords (comma-separated)
+  --fix                      Try to install missing tools (may require sudo)
+  --auto-heal                Auto-heal missing tools on start
+  -h, --help                 Show help
+  -v, --version              Show version
+
+Active (REQUIRES permission):
+  --active                   Enable active tests (ffuf/nuclei/nmap)
+  --yes-i-have-permission    Confirm you have written permission
+  --ffuf-threads N
+  --max-fetch N
+
+OOB / Interactsh:
+  --oob-mode true|false
+  --oob-client PATH
+
+Hydra:
+  --hydra-mode true|false
+  --hydra-service svc
+  --hydra-target URL
+  --hydra-userlist path
+  --hydra-passlist path
+  --hydra-threads N
+
+OpenAI:
+  --openai-summarize         Use OpenAI for semantic analysis (requires OPENAI_API_KEY)
+EOF
+}
+
+##########################
+# UTILITIES
+##########################
+log(){ echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] $*" | tee -a "$LOGFILE"; }
+die(){ echo "ERROR: $*" | tee -a "$LOGFILE" >&2; exit 1; }
+ensure_dir(){
+  mkdir -p "$OUTDIR" "$OUTDIR/headers" "$OUTDIR/http" "$OUTDIR/raw" "$OUTDIR/analysis" "$OUTDIR/oob" "$SKY_DB"
+  chmod 700 "$OUTDIR" || true
+}
+check_command(){ command -v "$1" >/dev/null 2>&1; }
+MISSING_TOOLS=(); MISSING_OPTIONAL=()
+check_required_tools(){
+  MISSING_TOOLS=()
+  for t in "${REQUIRED_TOOLS[@]}"; do
+    check_command "$t" || MISSING_TOOLS+=("$t")
+  done
+}
+check_optional_tools(){
+  MISSING_OPTIONAL=()
+  for t in "${OPTIONAL_TOOLS[@]}"; do
+    check_command "$t" || MISSING_OPTIONAL+=("$t")
+  done
+}
+
+##########################
+# SELF-HEAL / INSTALL HELPERS
+##########################
+install_with_apt(){
+  local pkg="$1"
+  if check_command apt-get; then
+    log "Installing $pkg with apt..."
+    sudo apt-get update -y && sudo apt-get install -y "$pkg"
+  else
+    log "apt-get not found; please install $pkg manually"
+  fi
+}
+install_python_deps(){
+  # lightweight Python deps for ML/NLP/visuals if pip available
+  if check_command pip3; then
+    log "Installing python deps (scikit-learn, pandas, nltk, matplotlib) - best-effort"
+    pip3 install --user scikit-learn pandas nltk matplotlib transformers >/dev/null 2>&1 || true
+    # download basic nltk data
+    python3 - <<PY 2>/dev/null || true
+try:
+    import nltk
+    nltk.download('punkt', quiet=True)
+except Exception:
+    pass
+PY
+  else
+    log "pip3 not found; skip python deps install"
+  fi
+}
+self_heal(){
+  log "Self-heal: checking and attempting to fix missing tools..."
+  check_required_tools; check_optional_tools
+  if [ ${#MISSING_TOOLS[@]} -gt 0 ]; then
+    log "Missing required: ${MISSING_TOOLS[*]}"
+    if [ "$FIX_INSTALL" = true ] || [ "$AUTO_HEAL" = true ]; then
+      for p in "${MISSING_TOOLS[@]}"; do install_with_apt "$p"; done
+    else
+      log "Run with --fix or --auto-heal to attempt installs"
+    fi
+  fi
+  if [ "$AUTO_HEAL" = true ]; then
+    install_python_deps
+  fi
+}
+
+smart_updater_check(){
+  echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] updater check" >> "$UPD_LOG" || true
+}
+
+##########################
+# PATTERN DB / FINGERPRINTS
+##########################
+db_store_fingerprint(){
+  local file="$1"
+  [ -f "$file" ] || return 0
+  local h; h=$(sha256sum "$file" | cut -d' ' -f1)
+  echo "$h|$(basename "$file")|$(date -u +%FT%T%Z)" >> "${SKY_DB}/fingerprints.log"
+}
+db_has_fingerprint(){
+  local file="$1"; [ -f "$file" ] || return 1
+  local h; h=$(sha256sum "$file" | cut -d' ' -f1)
+  grep -q "^${h}|" "${SKY_DB}/fingerprints.log" 2>/dev/null || return 1
+  return 0
+}
+
+##########################
+# PYTHON ML/NLP HELPERS (embedded small modules)
+##########################
+PY_HELPER="${HOME}/.sky_sh/sky_ml_helper.py"
+install_python_helper(){
+  mkdir -p "$(dirname "$PY_HELPER")"
+  cat > "$PY_HELPER" <<'PYHELP'
+#!/usr/bin/env python3
+# sky_ml_helper.py -- light ML/NLP helpers for sky.sh
+# uses simple heuristics; can be extended to TF-IDF/LogReg if models present
+
+import sys, json, os
+def basic_weighted_score(snippets_json):
+    out=[]
+    for s in snippets_json:
+        t=s.get("text","").lower()
+        score=0
+        reason=[]
+        if any(k in t for k in [".env","aws_access_key","private key","begin rsa"]):
+            score+=60; reason.append("sensitive_keyword")
+        if "token=" in t or "apikey" in t:
+            score+=50; reason.append("token_like")
+        if "password" in t or "db_password" in t:
+            score+=70; reason.append("credential")
+        if len(t)>1000: score+=10; reason.append("long_content")
+        level="LOW"
+        if score>=80: level="HIGH"
+        elif score>=40: level="MEDIUM"
+        else: level="LOW"
+        out.append({"score":score,"level":level,"reason":",".join(reason),"source":s.get("source","")})
+    print(json.dumps(out))
+if __name__=="__main__":
+    cmd=sys.argv[1] if len(sys.argv)>1 else "help"
+    if cmd=="score":
+        data=sys.stdin.read()
+        try:
+            snippets=json.loads(data)
+        except:
+            snippets=[]
+        basic_weighted_score(snippets)
+PYHELP
+  chmod +x "$PY_HELPER"
+}
+
+##########################
+# INTERACTSH / OOB
+##########################
+start_interactsh(){
+  if [ "$OOB_MODE" != true ]; then log "OOB disabled"; return 0; fi
+  if check_command interactsh-client; then
+    log "Starting interactsh client..."
+    OOB_FILE="${OUTDIR}/oob/interactsh_session.json"
+    mkdir -p "$(dirname "$OOB_FILE")"
+    interactsh-client -silent -ttl 120 -output "$OOB_FILE" &>/dev/null || true
+    sleep 1
+    if [ -f "$OOB_FILE" ]; then
+      OOB_DOMAIN=$(jq -r '.domain' "$OOB_FILE" 2>/dev/null || echo "")
+      log "OOB domain: ${OOB_DOMAIN:-(not found)}"
+    fi
+  else
+    log "interactsh-client not installed; use --fix to try install"
+  fi
+}
+check_interactsh_hits(){
+  local hits_file="${OUTDIR}/oob/oob_hits_snippet.txt"
+  : > "$hits_file"
+  if [ -f "${OOB_FILE:-}" ]; then
+    jq -r '.hits[]? | tostring' "${OOB_FILE}" 2>/dev/null >> "$hits_file" || true
+  fi
+  if [ -s "$hits_file" ]; then log "OOB hits saved to $hits_file"; else log "No OOB hits observed (local)"; fi
+}
+
+##########################
+# PASSIVE COLLECTION
+##########################
+collect_basic_files(){
+  log "Collecting root/robots/sitemap/.well-known for $TARGET"
+  base="https://${TARGET}"
+  curl -sSI --max-time 10 "$base/" -D "${OUTDIR}/headers/root_head.txt" 2>/dev/null || true
+  curl -sS --max-time 15 "$base/" -o "${OUTDIR}/http/root_body.html" 2>/dev/null || true
+  curl -sSI --max-time 10 "$base/robots.txt" -D "${OUTDIR}/headers/robots_head.txt" 2>/dev/null || true
+  curl -sS --max-time 10 "$base/robots.txt" -o "${OUTDIR}/http/robots_body.txt" 2>/dev/null || true
+  curl -sSI --max-time 10 "$base/sitemap.xml" -D "${OUTDIR}/headers/sitemap_head.txt" 2>/dev/null || true
+  curl -sS --max-time 12 "$base/sitemap.xml" -o "${OUTDIR}/http/sitemap.xml" 2>/dev/null || true
+  for w in openid-configuration security.txt assetlinks.json; do
+    curl -sS --max-time 8 "$base/.well-known/$w" -o "${OUTDIR}/http/well-known-$w" 2>/dev/null || true
+  done
+  db_store_fingerprint "${OUTDIR}/http/root_body.html" || true
+}
+
+collect_crtsh_subdomains(){
+  log "Querying crt.sh for subdomains..."
+  q="https://crt.sh/?q=%25.${TARGET}&output=json"
+  curl -sS "$q" -o "${OUTDIR}/raw/crtsh.json" 2>/dev/null || true
+  if check_command jq; then
+    jq -r '.[].name_value' "${OUTDIR}/raw/crtsh.json" 2>/dev/null | sed 's/\*\.//g' | sort -u > "${OUTDIR}/raw/subs_from_crtsh.txt" || true
+  else
+    grep -Eo '"name_value":"[^"]+"' "${OUTDIR}/raw/crtsh.json" | sed -E 's/.*:"([^"]+)"/\1/' | sed 's/\*\.//g' | sort -u > "${OUTDIR}/raw/subs_from_crtsh.txt" || true
+  fi
+  log "Subdomains saved"
+}
+
+gather_dns_whois(){
+  log "Collecting DNS/whois/TLS info..."
+  dig +short NS "$TARGET" > "${OUTDIR}/raw/dns_ns.txt" 2>/dev/null || true
+  dig +short A "$TARGET" > "${OUTDIR}/raw/dns_a.txt" 2>/dev/null || true
+  whois "$TARGET" > "${OUTDIR}/raw/whois.txt" 2>/dev/null || true
+  openssl s_client -connect "${TARGET}:443" -servername "${TARGET}" -showcerts </dev/null 2>/dev/null > "${OUTDIR}/raw/tls_cert.txt" || true
+}
+
+build_interesting_urls(){
+  log "Building interesting URLs..."
+  : > "${OUTDIR}/raw/interesting_urls.txt"
+  if [ -f "${OUTDIR}/http/sitemap.xml" ]; then
+    grep -Eo 'https?://[^<"]+' "${OUTDIR}/http/sitemap.xml" >> "${OUTDIR}/raw/interesting_urls.txt" || true
+  fi
+  grep -Eo 'href="[^"]+"' "${OUTDIR}/http/root_body.html" 2>/dev/null | sed -E 's/href="(.+)"/\1/' >> "${OUTDIR}/raw/interesting_urls.txt" || true
+  printf "https://%s/login\nhttps://%s/admin\nhttps://%s/.env\nhttps://%s/.git\n" "$TARGET" "$TARGET" "$TARGET" "$TARGET" >> "${OUTDIR}/raw/interesting_urls.txt"
+  if [ -f "${OUTDIR}/raw/subs_from_crtsh.txt" ]; then
+    awk '{print "https://" $1 "/"}' "${OUTDIR}/raw/subs_from_crtsh.txt" >> "${OUTDIR}/raw/interesting_urls.txt" || true
+  fi
+  if [ -n "$EXCLUDE_PATTERN" ]; then
+    IFS=',' read -ra EXS <<< "$EXCLUDE_PATTERN"
+    for e in "${EXS[@]}"; do
+      grep -v -i "$e" "${OUTDIR}/raw/interesting_urls.txt" > "${OUTDIR}/raw/interesting_urls.tmp" || true
+      mv "${OUTDIR}/raw/interesting_urls.tmp" "${OUTDIR}/raw/interesting_urls.txt" || true
+    done
+  fi
+  sort -u "${OUTDIR}/raw/interesting_urls.txt" -o "${OUTDIR}/raw/interesting_urls.txt" || true
+  log "interesting_urls: $(wc -l < "${OUTDIR}/raw/interesting_urls.txt" 2>/dev/null || echo 0)"
+}
+
+fetch_headers_bodies(){
+  log "Fetching headers/bodies (up to $MAX_FETCH)"
+  i=0
+  # ensure file exists to avoid errors
+  [ -f "${OUTDIR}/raw/interesting_urls.txt" ] || return 0
+  while IFS= read -r url; do
+    [ $i -ge "$MAX_FETCH" ] && break
+    safe=$(echo "$url" | sed 's/[^A-Za-z0-9._\/:-]/_/g')
+    headf="${OUTDIR}/headers/${safe}_head.txt"
+    bodyf="${OUTDIR}/http/${safe}_body.html"
+    if [ "$DRY_RUN" = true ]; then log "[DRY] curl -I $url"; else
+      curl -sSI --max-time 12 "$url" -D "$headf" 2>/dev/null || true
+      curl -sS --max-time 15 "$url" -o "$bodyf" 2>/dev/null || true
+      db_store_fingerprint "$bodyf"
+    fi
+    i=$((i+1))
+  done < "${OUTDIR}/raw/interesting_urls.txt"
+  log "Fetched $i urls"
+}
+
+##########################
+# EXPLORATORY ANALYSIS & PATTERN + NLP
+##########################
+extract_params_and_sensitive(){
+  log "Extracting params, forms, and sensitive snippets..."
+  mkdir -p "${OUTDIR}/analysis/exploratory"
+  grep -Eho 'href="[^"]+"|action="[^"]+"|\?[A-Za-z0-9_=&%\-]+' "${OUTDIR}/http/"* 2>/dev/null | sed -E 's/^(href|action)="//; s/"$//' | sort -u > "${OUTDIR}/analysis/exploratory/params_raw.txt" || true
+  grep -Ein --binary-files=text -r -e '\.env|\.git|BEGIN RSA PRIVATE KEY|BEGIN PRIVATE KEY|AKIA[0-9A-Z]{16}|DB_PASSWORD|JWT_SECRET|password|api_key|private.key' "${OUTDIR}/http" "${OUTDIR}/raw" 2>/dev/null | sed -n '1,500p' > "${OUTDIR}/analysis/exploratory/sensitive_snippets.txt" || true
+}
+
+pattern_analysis_and_nlp(){
+  mkdir -p "${OUTDIR}/analysis/patterns"
+  # build JSON snippets for python
+  snippets_file="${OUTDIR}/analysis/patterns/snippets.json"
+  : > "$snippets_file"
+  if [ -f "${OUTDIR}/analysis/exploratory/sensitive_snippets.txt" ] && [ -s "${OUTDIR}/analysis/exploratory/sensitive_snippets.txt" ]; then
+    echo "[" > "$snippets_file"
+    first=1
+    while IFS= read -r line; do
+      # escape quotes
+      esc=$(printf '%s' "$line" | sed 's/"/\\"/g')
+      if [ $first -eq 1 ]; then
+        printf '{"text":"%s","source":"sensitive_snippets.txt"}' "$esc" >> "$snippets_file"
+        first=0
+      else
+        printf ',\n{"text":"%s","source":"sensitive_snippets.txt"}' "$esc" >> "$snippets_file"
+      fi
+    done < "${OUTDIR}/analysis/exploratory/sensitive_snippets.txt"
+    echo "]" >> "$snippets_file"
+  else
+    echo "[]" > "$snippets_file"
+  fi
+
+  # scoring
+  score_out="${OUTDIR}/analysis/patterns/score_output.json"
+  if check_command python3; then
+    install_python_helper
+    if [ -s "${OUTDIR}/analysis/patterns/snippets.json" ] && [ "$(wc -c < "${OUTDIR}/analysis/patterns/snippets.json")" -gt 2 ]; then
+      # call helper
+      python3 - <<PY > "$score_out" 2>/dev/null || true
+import json,sys,subprocess
+try:
+    data=json.load(open("${OUTDIR}/analysis/patterns/snippets.json", "r", encoding="utf-8"))
+except Exception:
+    data=[]
+helper="${PY_HELPER}"
+out=[]
+if helper and __import__('os').path.exists(helper):
+    p=subprocess.Popen([helper,'score'], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    o,e=p.communicate(json.dumps(data))
+    try:
+        print(o)
+    except:
+        print("[]")
+else:
+    # fallback: simple heuristics
+    for s in data:
+        t=s.get('text','').lower()
+        sc=0
+        if any(k in t for k in ['.env','aws','begin rsa','private key','akia']):
+            sc+=60
+        if 'token=' in t or 'apikey' in t:
+            sc+=50
+        if 'password' in t:
+            sc+=70
+        if len(t)>200:
+            sc+=10
+        lvl='LOW'
+        if sc>=80: lvl='HIGH'
+        elif sc>=40: lvl='MEDIUM'
+        out.append({'score':sc,'level':lvl,'reason':'heuristic','source':'sensitive_snippets'})
+    print(json.dumps(out))
+PY
+    else
+      echo "[]" > "$score_out"
+    fi
+  else
+    # no python -> simple heuristics in bash
+    echo "[" > "$score_out"
+    first=1
+    while IFS= read -r ln; do
+      s=$(printf '%s' "$ln" | tr -d '\n' | sed 's/"/\\"/g')
+      score=0
+      lcase=$(printf '%s' "$s" | tr '[:upper:]' '[:lower:]')
+      if echo "$lcase" | grep -qE '\.env|\.git|token|password|aws|private key'; then score=$((score+60)); fi
+      if [ "${#s}" -gt 200 ]; then score=$((score+10)); fi
+      lvl="LOW"
+      [ "$score" -ge 80 ] && lvl="HIGH" || [ "$score" -ge 40 ] && lvl="MEDIUM"
+      if [ $first -eq 1 ]; then
+        printf '{"score":%d,"level":"%s","reason":"heuristic","source":"sensitive_snippets"}' "$score" "$lvl" >> "$score_out"
+        first=0
+      else
+        printf ',\n{"score":%d,"level":"%s","reason":"heuristic","source":"sensitive_snippets"}' "$score" "$lvl" >> "$score_out"
+      fi
+    done < "${OUTDIR}/analysis/exploratory/sensitive_snippets.txt" 2>/dev/null || true
+    echo "]" >> "$score_out"
+  fi
+  log "Pattern analysis completed (see ${score_out})"
+}
+
+##########################
+# SMART WEIGHTED SCORING ENGINE
+##########################
+weighted_scoring_engine(){
+  mkdir -p "${OUTDIR}/analysis/scores"
+  out="${OUTDIR}/analysis/scores/unified_scores.csv"
+  echo "item,source,base_score,weight,final_score,level,notes" > "$out"
+  if check_command jq && [ -f "${OUTDIR}/analysis/patterns/score_output.json" ]; then
+    jq -r '.[] | [.source, (.score // 0)] | @tsv' "${OUTDIR}/analysis/patterns/score_output.json" 2>/dev/null | nl -ba -w1 -s$'\t' | while IFS=$'\t' read -r idx src sc; do
+      item="snippet_${idx}"
+      base=${sc:-0}
+      w=1
+      if [ "$base" -ge 60 ]; then w=1.5; fi
+      final=$(awk -v b="$base" -v w="$w" 'BEGIN{printf("%.0f", b*w)}')
+      lvl="LOW"
+      [ "$final" -ge 80 ] && lvl="HIGH" || [ "$final" -ge 40 ] && lvl="MEDIUM"
+      echo "${item},${src},${base},${w},${final},${lvl},pattern_analysis" >> "$out"
+    done
+  fi
+  log "Unified scoring saved to $out"
+}
+
+##########################
+# SMART DIFFERENTIAL ANALYSIS
+##########################
+smart_differential_analysis(){
+  mkdir -p "${OUTDIR}/analysis/diff"
+  # for each fetched body, compare checksum to stored fingerprints
+  # enable nullglob so the for loop doesn't keep the literal if no file
+  shopt -s nullglob 2>/dev/null || true
+  for f in "${OUTDIR}/http/"*_body.html; do
+    [ -f "$f" ] || continue
+    h=$(sha256sum "$f" | cut -d' ' -f1)
+    if grep -q "^$h|" "${SKY_DB}/fingerprints.log" 2>/dev/null; then
+      echo "$(basename "$f"),SAME" >> "${OUTDIR}/analysis/diff/diff.txt"
+    else
+      echo "$(basename "$f"),DIFF" >> "${OUTDIR}/analysis/diff/diff.txt"
+    fi
+  done
+  # disable nullglob if available
+  shopt -u nullglob 2>/dev/null || true
+  log "Differential analysis saved to ${OUTDIR}/analysis/diff/diff.txt"
+}
+
+##########################
+# VISUAL ANALYTICS (simple)
+##########################
+generate_visual_summary(){
+  mkdir -p "${OUTDIR}/analysis/visuals"
+  subs=$( [ -f "${OUTDIR}/raw/subs_from_crtsh.txt" ] && wc -l < "${OUTDIR}/raw/subs_from_crtsh.txt" 2>/dev/null || echo 0 )
+  urls=$( [ -f "${OUTDIR}/raw/interesting_urls.txt" ] && wc -l < "${OUTDIR}/raw/interesting_urls.txt" 2>/dev/null || echo 0 )
+  nuclei_count=$( [ -f "${OUTDIR}/analysis/nuclei/nuclei_out.txt" ] && wc -l < "${OUTDIR}/analysis/nuclei/nuclei_out.txt" 2>/dev/null || echo 0 )
+  cat > "${OUTDIR}/analysis/visuals/summary.txt" <<SUM
+SKY.SH Visual Summary (${START_TS})
+---------------------------------
+Subdomains: ${subs}
+Interesting URLs: ${urls}
+Nuclei findings: ${nuclei_count}
+---------------------------------
+SUM
+
+  if check_command python3; then
+    # create a tiny plot only if matplotlib available
+    if python3 - <<PY >/dev/null 2>&1
+import importlib
+m=importlib.util.find_spec("matplotlib")
+print("yes" if m else "no")
+PY
+    then
+      python3 - <<PY
+import matplotlib.pyplot as plt, json
+subs=${subs}; urls=${urls}; nuclei=${nuclei_count}
+labels=['subdomains','urls','nuclei']
+vals=[subs,urls,nuclei]
+plt.figure(figsize=(4,2))
+plt.bar(labels,vals)
+plt.title('sky.sh summary')
+plt.tight_layout()
+plt.savefig("${OUTDIR}/analysis/visuals/summary.png")
+PY
+    fi
+  fi
+  log "Visual summary generated"
+}
+
+##########################
+# ACTIVE / CONTROLLED TOOLS (guarded)
+##########################
+run_ffuf(){
+  if ! check_command ffuf; then log "ffuf not installed; skipping."; return 0; fi
+  if [ "$ACTIVE" != true ]; then log "Active off; skipping ffuf."; return 0; fi
+  log "Running ffuf (controlled)..."
+  mkdir -p "${OUTDIR}/analysis/ffuf"
+  if [ "$DRY_RUN" = true ]; then log "[DRY] ffuf -u https://${TARGET}/FUZZ -w ${FFUF_WORDLIST}"; return 0; fi
+  ffuf -u "https://${TARGET}/FUZZ" -w "${FFUF_WORDLIST}" -t "${FFUF_THREADS}" -mc 200,301 -of json -o "${OUTDIR}/analysis/ffuf/ffuf_out.json" || true
+  log "ffuf done"
+}
+
+run_nuclei(){
+  if ! check_command nuclei; then log "nuclei not installed; skipping."; return 0; fi
+  if [ "$ACTIVE" != true ]; then log "Active off; skipping nuclei."; return 0; fi
+  log "Running nuclei (controlled)..."
+  mkdir -p "${OUTDIR}/analysis/nuclei"
+  if [ "$DRY_RUN" = true ]; then log "[DRY] nuclei -u https://${TARGET}"; return 0; fi
+  nuclei -u "https://${TARGET}" -o "${OUTDIR}/analysis/nuclei/nuclei_out.txt" || true
+  log "nuclei done"
+}
+
+run_nmap(){
+  if ! check_command nmap; then log "nmap not installed; skipping."; return 0; fi
+  if [ "$ACTIVE" != true ]; then log "Active off; skipping nmap."; return 0; fi
+  log "Running nmap (light)..."
+  if [ "$DRY_RUN" = true ]; then log "[DRY] nmap -Pn -p 80,443 ${TARGET}"; return 0; fi
+  nmap -Pn -p 80,443 -oN "${OUTDIR}/analysis/portscan_nmap.txt" "${TARGET}" || true
+}
+
+run_hydra(){
+  if [ "${HYDRA_MODE}" != true ]; then log "HYDRA_MODE disabled"; return 0; fi
+  if [ "$ACTIVE" != true ] || [ "$CONFIRMED" != true ]; then
+    log "Hydra requires ACTIVE mode and explicit confirmation; skipping"
+    return 0
+  fi
+  if ! check_command hydra; then log "hydra not installed; skipping."; return 0; fi
+  log "Running Hydra (controlled) -> ${OUTDIR}/analysis/hydra/hydra_out.txt"
+  mkdir -p "${OUTDIR}/analysis/hydra"
+  if [ "$DRY_RUN" = true ]; then log "[DRY] hydra (skipped)"; return 0; fi
+  if [ -n "${HYDRA_SERVICE:-}" ] && [ -n "${HYDRA_TARGET:-}" ]; then
+    hydra -L "${HYDRA_USERLIST:-/dev/null}" -P "${HYDRA_PASSLIST:-/dev/null}" -t "${HYDRA_THREADS}" "${HYDRA_TARGET}" "${HYDRA_SERVICE}" > "${OUTDIR}/analysis/hydra/hydra_out.txt" 2>&1 || true
+  else
+    log "Hydra configuration incomplete; skipping"
+  fi
+  log "Hydra finished"
+}
+
+##########################
+# VALIDATION & TAGGING
+##########################
+self_validate_result(){
+  # args: endpoint bodyfile
+  local endpoint="$1"; local body="$2"
+  local confidence=0
+  local tmp1 tmp2
+  tmp1=$(mktemp); tmp2=$(mktemp)
+  curl -sS -A "Mozilla/5.0 (compatible; SkyBot/7.0)" --max-time 10 "$endpoint" -o "$tmp1" || true
+  curl -sS -A "curl/7.x (sky)" --max-time 10 "$endpoint" -o "$tmp2" || true
+  if [ -s "$tmp1" ] && [ -s "$tmp2" ]; then
+    h1=$(sha256sum "$tmp1" | cut -d' ' -f1)
+    h2=$(sha256sum "$tmp2" | cut -d' ' -f1)
+    [ "$h1" = "$h2" ] && confidence=$((confidence+30))
+  fi
+  if [ -s "$body" ]; then
+    hb=$(sha256sum "$body" | cut -d' ' -f1)
+    grep -q "^${hb}|" "${SKY_DB}/fingerprints.log" 2>/dev/null && confidence=$((confidence+20))
+  fi
+  if [ -f "${OUTDIR}/oob/oob_hits_snippet.txt" ]; then
+    grep -qi "$(basename "$endpoint")" "${OUTDIR}/oob/oob_hits_snippet.txt" 2>/dev/null && confidence=$((confidence+40)) || true
+  fi
+  rm -f "$tmp1" "$tmp2"
+  if [ "$confidence" -ge 70 ]; then echo "HIGH"; elif [ "$confidence" -ge 40 ]; then echo "MEDIUM"; else echo "LOW"; fi
+}
+
+validate_and_tag_findings(){
+  mkdir -p "${OUTDIR}/analysis/validated"
+  if [ -f "${OUTDIR}/analysis/nuclei/nuclei_out.txt" ]; then
+    awk '1' "${OUTDIR}/analysis/nuclei/nuclei_out.txt" | sed -n '1,500p' > "${OUTDIR}/analysis/validated/nuclei_candidates.txt" || true
+    while IFS= read -r line; do
+      endpoint=$(echo "$line" | awk '{print $NF}')
+      safe=$(mktemp)
+      curl -sS --max-time 10 "$endpoint" -o "$safe" || true
+      lvl=$(self_validate_result "$endpoint" "$safe")
+      echo "$lvl|$line" >> "${OUTDIR}/analysis/validated/nuclei_validated.txt"
+      rm -f "$safe"
+    done < "${OUTDIR}/analysis/validated/nuclei_candidates.txt"
+  fi
+  if [ -f "${OUTDIR}/analysis/ffuf/ffuf_out.json" ] && check_command jq; then
+    jq -r '.results[] | .input + " " + (.status|tostring)' "${OUTDIR}/analysis/ffuf/ffuf_out.json" > "${OUTDIR}/analysis/validated/ffuf_candidates.txt" || true
+    while IFS= read -r l; do
+      endpoint=$(echo "$l" | awk '{print $1}')
+      safe=$(mktemp)
+      curl -sS --max-time 10 "$endpoint" -o "$safe" || true
+      lvl=$(self_validate_result "$endpoint" "$safe")
+      echo "$lvl|$l" >> "${OUTDIR}/analysis/validated/ffuf_validated.txt"
+      rm -f "$safe"
+    done < "${OUTDIR}/analysis/validated/ffuf_candidates.txt"
+  fi
+  log "Validation complete"
+}
+
+##########################
+# OPENAI SEMANTIC (OPTIONAL)
+##########################
+openai_semantic_scan(){
+  if [ "$OPENAI_SUMMARIZE" != true ]; then log "OpenAI disabled"; return 0; fi
+  if [ -z "$OPENAI_API_KEY" ]; then log "OPENAI_API_KEY not set; skipping"; return 0; fi
+  local snippet_file="${OUTDIR}/analysis/exploratory/sensitive_snippets.txt"
+  [ -f "$snippet_file" ] || (log "No snippets for OpenAI"; return 0)
+  excerpt=$(head -c 25000 "$snippet_file")
+  log "Sending excerpt to OpenAI for semantic classification..."
+  resp=$(curl -sS -X POST "https://api.openai.com/v1/chat/completions" \
+    -H "Authorization: Bearer ${OPENAI_API_KEY}" \
+    -H "Content-Type: application/json" \
+    -d @- <<JSON
+{"model":"${OPENAI_MODEL}","messages":[{"role":"system","content":"You are a security assistant. Classify if the following snippet likely indicates sensitive data leakage, config leak, or false positive. Provide short reasoning and remediation."},{"role":"user","content":"${excerpt}"}],"max_tokens":400}
+JSON
+)
+  echo "$resp" | jq -r '.choices[0].message.content' > "${OUTDIR}/analysis/exploratory/openai_analysis.txt" 2>/dev/null || echo "$resp" > "${OUTDIR}/analysis/exploratory/openai_analysis.txt"
+  log "OpenAI analysis saved"
+}
+
+##########################
+# PACKAGE & REDACT
+##########################
+redact_file(){
+  local in="$1"; local out="$2"
+  sed -E -e 's/(token=)[A-Za-z0-9_\-]+/\1<REDACTED>/Ig' \
+         -e 's/(api[_-]?key=)[A-Za-z0-9_\-]+/\1<REDACTED>/Ig' \
+         -e 's/(AWS|AKIA)[A-Za-z0-9_\-]+/<REDACTED>/Ig' \
+         -e 's/BEGIN RSA PRIVATE KEY/<REDACTED>/' "$in" > "$out" || cp "$in" "$out"
+}
+package_for_sharing(){
+  log "Packaging redacted evidence..."
+  mkdir -p "${OUTDIR}/for_sharing/files"
+  # gather list safely
+  files_list=()
+  for p in "${OUTDIR}/headers" "${OUTDIR}/http" "${OUTDIR}/analysis/exploratory"; do
+    if [ -d "$p" ]; then
+      while IFS= read -r -d '' f; do
+        files_list+=("$f")
+      done < <(find "$p" -maxdepth 1 -type f -print0 2>/dev/null)
+    fi
+  done
+  for f in "${files_list[@]}"; do
+    [ -e "$f" ] || continue
+    base=$(basename "$f")
+    redact_file "$f" "${OUTDIR}/for_sharing/files/${base}.redacted"
+  done
+  (cd "${OUTDIR}/for_sharing" && sha256sum files/* > files.sha256 || true)
+  (cd "${OUTDIR}/for_sharing" && zip -r "${OUTDIR}/for_sharing_${START_TS}.zip" files files.sha256) || true
+  log "Packaged ${OUTDIR}/for_sharing_${START_TS}.zip"
+}
+
+##########################
+# SMART SCHEDULER (simple)
+##########################
+smart_scheduler(){
+  local interval="${SKY_SCHED_INTERVAL:-0}"
+  if [ "$interval" -le 0 ]; then return 0; fi
+  ( while true; do
+      log "Smart scheduler tick: running lightweight update tasks"
+      smart_updater_check
+      collect_basic_files
+      sleep "$interval"
+    done ) & disown
+  log "Scheduler started (interval=${interval}s)"
+}
+
+##########################
+# SUMMARY (colored)
+##########################
+print_summary(){
+  local subs urls ffuf_count nuclei_count oob_hits hydra_lines
+  subs=$( [ -f "${OUTDIR}/raw/subs_from_crtsh.txt" ] && wc -l < "${OUTDIR}/raw/subs_from_crtsh.txt" 2>/dev/null || echo 0 )
+  urls=$( [ -f "${OUTDIR}/raw/interesting_urls.txt" ] && wc -l < "${OUTDIR}/raw/interesting_urls.txt" 2>/dev/null || echo 0 )
+  ffuf_count=$( [ -f "${OUTDIR}/analysis/ffuf/ffuf_out.json" ] && jq -r '.results|length' "${OUTDIR}/analysis/ffuf/ffuf_out.json" 2>/dev/null || echo 0 )
+  nuclei_count=$( [ -f "${OUTDIR}/analysis/nuclei/nuclei_out.txt" ] && wc -l < "${OUTDIR}/analysis/nuclei/nuclei_out.txt" 2>/dev/null || echo 0 )
+  oob_hits=$( [ -f "${OUTDIR}/oob/oob_hits_snippet.txt" ] && wc -l < "${OUTDIR}/oob/oob_hits_snippet.txt" 2>/dev/null || echo 0 )
+  hydra_lines=$( [ -f "${OUTDIR}/analysis/hydra/hydra_out.txt" ] && wc -l < "${OUTDIR}/analysis/hydra/hydra_out.txt" 2>/dev/null || echo 0 )
+
+  GREEN=$(tput setaf 2 || true); YELLOW=$(tput setaf 3 || true); RED=$(tput setaf 1 || true); MAG=$(tput setaf 5 || true); RESET=$(tput sgr0 || true)
+
+  echo
+  echo "======================= SKY.SH $VERSION SUMMARY ======================="
+  printf "%sSubdomains:%s %s\n" "$YELLOW" "$RESET" "$subs"
+  printf "%sInteresting URLs:%s %s\n" "$YELLOW" "$RESET" "$urls"
+  printf "%sffuf matches:%s %s\n" "$GREEN" "$RESET" "$ffuf_count"
+  printf "%snuclei findings:%s %s\n" "$MAG" "$RESET" "$nuclei_count"
+  printf "%sOOB hits:%s %s\n" "$RED" "$RESET" "$oob_hits"
+  printf "%sHydra lines:%s %s\n" "$YELLOW" "$RESET" "$hydra_lines"
+  echo "Redacted package: ${OUTDIR}/for_sharing_${START_TS}.zip (if created)"
+  echo "Logs: $LOGFILE"
+  echo "=================================================================="
+  echo
+}
+
+##########################
+# MAIN
+##########################
+main(){
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -t|--target) TARGET="$2"; shift 2 ;;
+      --dry-run) DRY_RUN=true; shift ;;
+      --outbase) OUTBASE="$2"; shift 2 ;;
+      --exclude) EXCLUDE_PATTERN="$2"; shift 2 ;;
+      --fix) FIX_INSTALL=true; shift ;;
+      --auto-heal) AUTO_HEAL=true; shift ;;
+      --active) ACTIVE=true; shift ;;
+      --yes-i-have-permission) CONFIRMED=true; shift ;;
+      --ffuf-threads) FFUF_THREADS="$2"; shift 2 ;;
+      --max-fetch) MAX_FETCH="$2"; shift 2 ;;
+      --oob-mode) OOB_MODE="$2"; shift 2 ;;
+      --oob-client) INTERACTSH_CLIENT="$2"; shift 2 ;;
+      --hydra-mode) HYDRA_MODE="$2"; shift 2 ;;
+      --hydra-service) HYDRA_SERVICE="$2"; shift 2 ;;
+      --hydra-target) HYDRA_TARGET="$2"; shift 2 ;;
+      --hydra-userlist) HYDRA_USERLIST="$2"; shift 2 ;;
+      --hydra-passlist) HYDRA_PASSLIST="$2"; shift 2 ;;
+      --hydra-threads) HYDRA_THREADS="$2"; shift 2 ;;
+      --openai-summarize) OPENAI_SUMMARIZE=true; shift ;;
+      -h|--help) usage; exit 0 ;;
+      -v|--version) echo "$PROGNAME $VERSION"; exit 0 ;;
+      *) echo "Unknown arg $1"; usage; exit 1 ;;
+    esac
+  done
+
+  [ -n "$TARGET" ] || (usage; die "Target (-t) required")
+  OUTDIR="${OUTBASE}/${TARGET}_${START_TS}"
+  LOGFILE="${OUTDIR}/sky.log"
+  ensure_dir
+  log "Starting $PROGNAME $VERSION for $TARGET"
+  log "Settings: DRY_RUN=$DRY_RUN ACTIVE=$ACTIVE CONFIRMED=$CONFIRMED OOB_MODE=$OOB_MODE HYDRA_MODE=$HYDRA_MODE OPENAI_SUMMARIZE=$OPENAI_SUMMARIZE"
+
+  check_required_tools; check_optional_tools
+  if [ ${#MISSING_TOOLS[@]} -gt 0 ] || [ ${#MISSING_OPTIONAL[@]} -gt 0 ]; then
+    log "Missing required/optional: ${MISSING_TOOLS[*]:-none} ${MISSING_OPTIONAL[*]:-none}"
+    if [ "$FIX_INSTALL" = true ] || [ "$AUTO_HEAL" = true ]; then
+      self_heal
+    else
+      log "Run with --fix or --auto-heal to attempt automated installs"
+    fi
+  fi
+
+  smart_updater_check
+  install_python_helper
+  if [ "$OOB_MODE" = true ]; then start_interactsh; fi
+
+  collect_basic_files
+  collect_crtsh_subdomains
+  gather_dns_whois
+  build_interesting_urls
+  fetch_headers_bodies
+
+  extract_params_and_sensitive
+  pattern_analysis_and_nlp
+  weighted_scoring_engine
+  smart_differential_analysis
+  generate_visual_summary
+
+  if [ "$ACTIVE" = true ]; then
+    if [ "$CONFIRMED" != true ]; then die "Active requested but no confirmation (--yes-i-have-permission)"; fi
+    run_ffuf
+    run_nuclei
+    run_nmap
+  fi
+
+  run_hydra
+  validate_and_tag_findings
+
+  if [ "$OOB_MODE" = true ]; then sleep 3; check_interactsh_hits; fi
+  if [ "$OPENAI_SUMMARIZE" = true ]; then openai_semantic_scan; fi
+
+  package_for_sharing
+  print_summary
+  log "Finished. Evidence in: $OUTDIR"
+}
+
+main "$@"

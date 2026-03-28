@@ -1,0 +1,62 @@
+Running: /app/core/legacy/sky.sh -t example.com --outbase /data/jobs/example.com_20251020T190003Z --dry-run
+
+=== STDOUT ===
+[2025-10-20T19:00:03Z] Starting sky.sh v7.0 for example.com
+[2025-10-20T19:00:03Z] Settings: DRY_RUN=true ACTIVE=false CONFIRMED=false OOB_MODE=false HYDRA_MODE=false OPENAI_SUMMARIZE=false
+[2025-10-20T19:00:03Z] Missing required/optional: curl
+jq
+dig
+whois
+zip
+unzip
+xxd ffuf
+nuclei
+nmap
+hydra
+tcpdump
+interactsh-client
+[2025-10-20T19:00:03Z] Run with --fix or --auto-heal to attempt automated installs
+[2025-10-20T19:00:03Z] Collecting root/robots/sitemap/.well-known for example.com
+[2025-10-20T19:00:04Z] Querying crt.sh for subdomains...
+[2025-10-20T19:00:04Z] Subdomains saved
+[2025-10-20T19:00:04Z] Collecting DNS/whois/TLS info...
+[2025-10-20T19:00:04Z] Building interesting URLs...
+[2025-10-20T19:00:04Z] interesting_urls: 4
+[2025-10-20T19:00:04Z] Fetching headers/bodies (up to 200)
+[2025-10-20T19:00:04Z] [DRY] curl -I https://example.com/.env
+[2025-10-20T19:00:04Z] [DRY] curl -I https://example.com/.git
+[2025-10-20T19:00:04Z] [DRY] curl -I https://example.com/admin
+[2025-10-20T19:00:04Z] [DRY] curl -I https://example.com/login
+[2025-10-20T19:00:04Z] Fetched 4 urls
+[2025-10-20T19:00:04Z] Extracting params, forms, and sensitive snippets...
+[2025-10-20T19:00:05Z] Pattern analysis completed (see /data/jobs/example.com_20251020T190003Z/example.com_20251020T190003Z/analysis/patterns/score_output.json)
+[2025-10-20T19:00:05Z] Unified scoring saved to /data/jobs/example.com_20251020T190003Z/example.com_20251020T190003Z/analysis/scores/unified_scores.csv
+[2025-10-20T19:00:05Z] Differential analysis saved to /data/jobs/example.com_20251020T190003Z/example.com_20251020T190003Z/analysis/diff/diff.txt
+[2025-10-20T19:00:05Z] Visual summary generated
+[2025-10-20T19:00:05Z] HYDRA_MODE disabled
+[2025-10-20T19:00:05Z] Validation complete
+[2025-10-20T19:00:05Z] Packaging redacted evidence...
+[2025-10-20T19:00:05Z] Packaged /data/jobs/example.com_20251020T190003Z/example.com_20251020T190003Z/for_sharing_20251020T190003Z.zip
+
+======================= SKY.SH v7.0 SUMMARY =======================
+Subdomains: 0
+Interesting URLs: 4
+ffuf matches: 0
+nuclei findings: 0
+OOB hits: 0
+Hydra lines: 0
+Redacted package: /data/jobs/example.com_20251020T190003Z/example.com_20251020T190003Z/for_sharing_20251020T190003Z.zip (if created)
+Logs: /data/jobs/example.com_20251020T190003Z/example.com_20251020T190003Z/sky.log
+==================================================================
+
+[2025-10-20T19:00:05Z] Finished. Evidence in: /data/jobs/example.com_20251020T190003Z/example.com_20251020T190003Z
+
+=== STDERR ===
+grep: /data/jobs/example.com_20251020T190003Z/example.com_20251020T190003Z/raw/crtsh.json: No such file or directory
+/app/core/legacy/sky.sh: line 673: zip: command not found
+tput: No value for $TERM and no -T specified
+tput: No value for $TERM and no -T specified
+tput: No value for $TERM and no -T specified
+tput: No value for $TERM and no -T specified
+tput: No value for $TERM and no -T specified
+

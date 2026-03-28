@@ -1,0 +1,7 @@
+{
+  "name": "dir_brute_sim",
+  "type": "DIR_BRUTE",
+  "risk": "LOW",
+  "description": "Simulated directory brute force (safe).",
+  "run": "run.sh"
+}

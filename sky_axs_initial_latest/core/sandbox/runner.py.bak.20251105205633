@@ -1,0 +1,272 @@
+#!/usr/bin/env python3
+"""
+Sandbox runner (Docker-based) - core/sandbox/runner.py
+
+This runner:
+ - Finds a PoC folder under configured POC_HOST_DIR (default: pocs/ then core/sandbox/pocs/)
+ - Copies the PoC folder into a temporary workdir on the host
+ - Ensures run.sh is executable
+ - Starts a short-lived Docker container mounting the PoC folder at /run_poc (ro)
+ - Executes /bin/sh -c "/run_poc/run.sh <target> <extra>"
+ - Collects logs, exit code and writes a JSON result file into RESULTS_DIR
+
+Usage (internal API):
+    job_path, result = run_in_sandbox(target, extra="", timeout=30)
+
+Returns:
+    (path_to_result_json, result_dict)
+"""
+import os
+import time
+import json
+import uuid
+import shutil
+import logging
+import subprocess
+from pathlib import Path
+from datetime import datetime
+
+# try import docker; if not available, raise a clear error
+try:
+    import docker
+    from docker.errors import APIError, NotFound
+except Exception:
+    docker = None
+    APIError = Exception
+    NotFound = Exception
+
+LOG = logging.getLogger("sandbox.runner")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+
+# configuration
+DEFAULT_IMAGE = os.environ.get("SANDBOX_IMAGE", "python:3.11-slim")
+# where host PoCs live (project-level pocs/ first, fallback to core/sandbox/pocs)
+POSSIBLE_POC_DIRS = [
+    os.path.abspath("pocs"),
+    os.path.abspath("core/sandbox/pocs"),
+]
+POCS_HOST_DIR = next((p for p in POSSIBLE_POC_DIRS if os.path.isdir(p)), POSSIBLE_POC_DIRS[0])
+RESULTS_DIR = os.path.abspath(os.environ.get("SANDBOX_RESULTS_DIR", "data/results"))
+os.makedirs(RESULTS_DIR, exist_ok=True)
+
+def _parse_extra(extra: str):
+    if not extra:
+        return {"mode": "cmd", "cmd": 'echo "POC default stub"'}
+    e = extra.strip()
+    if e.startswith("--poc="):
+        return {"mode": "poc", "poc": e.split("=", 1)[1].strip()}
+    if e.startswith("--cmd="):
+        return {"mode": "cmd", "cmd": e.split("=", 1)[1].strip().strip('"')}
+    return {"mode": "cmd", "cmd": e}
+
+def _locate_poc(poc_name: str):
+    cand = os.path.join(POCS_HOST_DIR, poc_name)
+    if os.path.isdir(cand):
+        return os.path.abspath(cand)
+    return None
+
+def _write_result_file(target: str, poc_name: str, extra: str, result: dict):
+    ts = datetime.utcnow().strftime("%Y%m%d%H%M%S")
+    jid = result.get("job_id", uuid.uuid4().hex[:12])
+    fname = f"{target.replace('://', '_').replace('/', '_')}_{ts}_{jid}.json"
+    path = os.path.join(RESULTS_DIR, fname)
+    os.makedirs(RESULTS_DIR, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(result, f, indent=2)
+    LOG.info("Wrote sandbox result to: %s", path)
+    return path
+
+def _prepare_workdir(poc_dir: str):
+    workid = uuid.uuid4().hex[:12]
+    workdir = Path(f"/tmp/axs_sandbox_{workid}")
+    poctarget = workdir / "run_poc"
+    if workdir.exists():
+        shutil.rmtree(workdir)
+    workdir.mkdir(parents=True, exist_ok=True)
+    shutil.copytree(poc_dir, poctarget)
+    run_sh = poctarget / "run.sh"
+    if run_sh.exists():
+        mode = run_sh.stat().st_mode
+        run_sh.chmod(mode | 0o100)
+    else:
+        LOG.warning("PoC has no run.sh: %s", run_sh)
+    return workdir, poctarget
+
+def _cleanup_workdir(workdir: Path):
+    try:
+        if workdir.exists():
+            shutil.rmtree(workdir)
+    except Exception as e:
+        LOG.warning("Failed to cleanup workdir %s: %s", workdir, e)
+
+def _ensure_docker_client():
+    if docker is None:
+        raise RuntimeError("docker python package not installed. Run: python3 -m pip install docker")
+    client = docker.from_env()
+    try:
+        client.ping()
+    except Exception as e:
+        raise RuntimeError(f"Docker not available or not running: {e}")
+    return client
+
+def run_in_sandbox(target: str, extra: str = "", timeout: int = 30):
+    job_id = uuid.uuid4().hex[:12]
+    started_at = datetime.utcnow().isoformat()
+    parsed = _parse_extra(extra)
+    mode = parsed.get("mode")
+    LOG.info("Starting sandbox run: target=%s mode=%s extra=%s", target, mode, extra)
+
+    result = {
+        "job_id": job_id,
+        "target": target,
+        "extra": extra,
+        "status": "error",
+        "timestamp": started_at,
+        "container": None,
+        "output": "",
+        "exit_code": None,
+        "notes": [],
+    }
+
+    poc_dir = None
+    poc_name = None
+    if mode == "poc":
+        poc_name = parsed.get("poc")
+        poc_dir = _locate_poc(poc_name)
+        if not poc_dir:
+            result["status"] = "failed"
+            result["notes"].append(f"PoC not found: {os.path.join(POCS_HOST_DIR, poc_name)}")
+            path = _write_result_file(target, poc_name or "unknown", extra, result)
+            return path, result
+
+    temp_workdir = None
+    try:
+        client = _ensure_docker_client()
+    except Exception as e:
+        result["status"] = "error"
+        result["notes"].append(f"Docker error: {e}")
+        return None, result
+
+    workdir = None
+    try:
+        if mode == "poc":
+            workdir, poctarget = _prepare_workdir(poc_dir)
+            run_cmd = f"/run_poc/run.sh \"{target}\" \"{extra or ''}\""
+        else:
+            workdir = Path(f"/tmp/axs_sandbox_{uuid.uuid4().hex[:12]}")
+            poctarget = workdir / "run_poc"
+            poctarget.mkdir(parents=True, exist_ok=True)
+            script = poctarget / "run.sh"
+            cmd_to_run = parsed.get("cmd", 'echo "POC default stub"')
+            script_text = f"#!/bin/sh\nset -eu\nTARGET=\"$1\"\nEXTRA=\"$2\"\n{cmd_to_run}\n"
+            script.write_text(script_text)
+            script.chmod(0o755)
+            run_cmd = f"/run_poc/run.sh \"{target}\" \"{extra or ''}\""
+
+        try:
+            client.images.pull(DEFAULT_IMAGE)
+        except Exception:
+            LOG.debug("Image pull failed or not required.", exc_info=True)
+
+        container_name = f"axs_sandbox_{uuid.uuid4().hex[:12]}"
+        bind_src = str(poctarget)
+        volumes = {
+            bind_src: {"bind": "/run_poc", "mode": "ro"}
+        }
+
+        create_kwargs = {
+            "image": DEFAULT_IMAGE,
+            "name": container_name,
+            "command": ["/bin/sh", "-c", run_cmd],
+            "detach": True,
+            "network_disabled": True,
+            "volumes": volumes,
+            "stdin_open": False,
+            "tty": False,
+            "security_opt": ["no-new-privileges"],
+            "cap_drop": ["ALL"],
+            "mem_limit": "512m",
+            "pids_limit": 64,
+        }
+
+        LOG.info("Creating container %s", container_name)
+        container = client.containers.create(**create_kwargs)
+        result["container"] = container.name
+
+        LOG.info("Starting container %s", container.name)
+        container.start()
+
+        try:
+            waited = container.wait(timeout=timeout)
+            exit_code = int(waited.get("StatusCode", 1))
+            logs = container.logs(stdout=True, stderr=True)
+            out_text = logs.decode(errors="ignore") if isinstance(logs, (bytes, bytearray)) else str(logs)
+            result["exit_code"] = exit_code
+            result["output"] = out_text
+            result["status"] = "ok" if exit_code == 0 else "failed"
+            LOG.info("Container finished: %s exit=%s", container.name, exit_code)
+        except Exception as e:
+            try:
+                logs = container.logs(stdout=True, stderr=True)
+                out_text = logs.decode(errors="ignore") if isinstance(logs, (bytes, bytearray)) else str(logs)
+            except Exception:
+                out_text = f"(failed to read logs: {e})"
+            result["exit_code"] = 1
+            result["output"] = out_text + f"\nException: {e}"
+            result["status"] = "failed"
+            LOG.warning("Container run error: %s", e)
+
+        try:
+            container.remove(force=True)
+        except Exception:
+            LOG.debug("Failed to remove container cleanly.", exc_info=True)
+
+    except Exception as e:
+        LOG.exception("Unexpected error running sandbox PoC")
+        result["status"] = "error"
+        result["notes"].append(str(e))
+    finally:
+        if workdir is not None:
+            _cleanup_workdir(Path(workdir))
+
+    path = _write_result_file(target, poc_name or "inline", extra, result)
+    return path, result
+
+if __name__ == "__main__":
+    import sys
+    if len(sys.argv) < 2:
+        print("Usage: runner.py <target> [--extra='...'] [timeout]")
+        sys.exit(1)
+    tgt = sys.argv[1]
+    extra = ""
+    timeout = 20
+    if len(sys.argv) >= 3:
+        extra = sys.argv[2]
+    if len(sys.argv) >= 4:
+        try:
+            timeout = int(sys.argv[3])
+        except:
+            pass
+    p, r = run_in_sandbox(tgt, extra=extra, timeout=timeout)
+    print("Result JSON:", p)
+    print(json.dumps(r, indent=2))
+
+
+
+class SandboxRunner:
+    """Compatibility shim for old dispatcher imports."""
+    def __init__(self):
+        pass
+    def run(self, target: str, extra: str = "", timeout: int = 30):
+        from core.sandbox.runner import run_in_sandbox
+        return run_in_sandbox(target, extra=extra, timeout=timeout)
+# --- Compatibility helpers (fixed) ---
+
+# expose module-level function run_in_sandbox only
+def run_in_sandbox(target: str, extra: str = "", timeout: int = 30):
+    """
+    Backwards compat: call the new run() directly without instantiating SandboxRunner again.
+    """
+    return run_in_sandbox.__self__.run(target, extra=extra, timeout=timeout) if hasattr(run_in_sandbox, "__self__") \
+        else SandboxRunner().run(target, extra=extra, timeout=timeout)
+

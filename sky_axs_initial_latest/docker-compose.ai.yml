@@ -1,0 +1,41 @@
+version: "3.9"
+services:
+  metrics_collector:
+    build:
+      context: .
+      dockerfile: core/ai_ops/metrics_collector/Dockerfile
+    image: sky_axs_initial-metrics
+    container_name: sky_axs_initial-metrics
+    environment:
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - API_URL=http://api:8000/health
+      - INTERVAL=10
+      - STREAM_KEY=metrics
+    depends_on:
+      - redis
+      - api
+    restart: unless-stopped
+
+  trainer:
+    build:
+      context: .
+      dockerfile: core/ai_ops/trainer/Dockerfile
+    image: sky_axs_initial-trainer
+    container_name: sky_axs_initial-trainer
+    environment:
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - STREAM_KEY=metrics
+      - WINDOW_SEC=1800
+      - TRAIN_EVERY_SEC=300
+      - MODEL_DIR=/data/models
+    volumes:
+      - models_data:/data/models
+    depends_on:
+      - redis
+    restart: unless-stopped
+
+volumes:
+  models_data:
+    name: sky_axs_initial_models

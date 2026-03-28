@@ -1,0 +1,28 @@
+{
+  "pocs": [
+    {
+      "file": "xss_reflected.sh",
+      "tags": ["WEB","xss","http"],
+      "priority": 10,
+      "needs_network": false
+    },
+    {
+      "file": "sql_injection.sh",
+      "tags": ["WEB","sql","http"],
+      "priority": 9,
+      "needs_network": false
+    },
+    {
+      "file": "mobile_api_check.sh",
+      "tags": ["MOBILE","api","android","ios"],
+      "priority": 8,
+      "needs_network": true
+    },
+    {
+      "file": "ssrf_check.sh",
+      "tags": ["WEB","ssrf"],
+      "priority": 6,
+      "needs_network": false
+    }
+  ]
+}

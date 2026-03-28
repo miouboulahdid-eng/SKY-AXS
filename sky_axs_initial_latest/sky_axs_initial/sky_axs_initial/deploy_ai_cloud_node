@@ -1,0 +1,207 @@
+#!/usr/bin/env bash
+# deploy_ai_cloud_node.sh
+# يبني/يشغل عقدة AI على Spot EC2، يرفع محرك AI إلى S3، يثبت المتطلبات
+# ويطلق مهمة تجريبية (Dry-run) عبر SSM.. مع سيطرة على التكلفة.
+set -euo pipefail
+IFS=$'\n\t'
+
+# ==== الإعدادات (يمكن تعديلها عبر متغيرات بيئة) ====
+REGION="${REGION:-eu-north-1}"
+BUCKET="${BUCKET:-my-sky-axs-bucket-yourname}"
+AI_KEY_PREFIX="${AI_KEY_PREFIX:-ai_engine}"
+AI_TARBALL="${AI_TARBALL:-ai_engine.tar.gz}"
+ROLE_NAME="${ROLE_NAME:-sky-axs-ec2-ssm-role}"
+PROFILE_NAME="${PROFILE_NAME:-sky-axs-ec2-instance-profile}"
+SG_NAME="${SG_NAME:-sky-axs-sg-no-inbound}"
+KEYPAIR_NAME="${KEYPAIR_NAME:-sky-axs-key}"
+INSTANCE_TYPE="${INSTANCE_TYPE:-t3.large}"
+TAG_NAME="${TAG_NAME:-sky-axs-ai-spot}"
+PROJECT_TAG="${PROJECT_TAG:-sky-axs}"
+TARGET="${TARGET:-example.com}"
+RUN_MODE="${RUN_MODE:-dry}"   # dry | active
+AUTO_TERMINATE="${AUTO_TERMINATE:-true}"  # true لغلق السيرفر بعد التنفيذ
+
+# ==== مسارات المشروع المحلي ====
+PROJECT_ROOT="${PROJECT_ROOT:-$PWD}"
+LEGACY_SKY="${LEGACY_SKY:-$PROJECT_ROOT/core/legacy/sky.sh}"
+AI_DIR="${AI_DIR:-$PROJECT_ROOT/core/ai_engine}"
+
+log(){ echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] $*"; }
+die(){ echo "ERROR: $*" >&2; exit 1; }
+
+# ==== فحوصات أولية ====
+command -v aws >/dev/null 2>&1 || die "aws CLI غير مثبت"
+command -v jq  >/dev/null 2>&1 || die "jq غير مثبت"
+aws sts get-caller-identity >/dev/null || die "AWS creds غير صالحة"
+
+log "AWS Identity ok. Region=$REGION, Bucket=$BUCKET"
+[ -f "$LEGACY_SKY" ] || die "لم أجد sky.sh محلياً: $LEGACY_SKY"
+
+# ==== تجهيز AI Engine محلياً لو غير موجود ====
+if [ ! -d "$AI_DIR" ]; then
+  log "AI engine غير موجود محلياً، إنشاء هيكل افتراضي..."
+  mkdir -p "$AI_DIR"
+  cat > "$AI_DIR/requirements.txt" <<'REQ'
+boto3
+requests
+tqdm
+numpy
+pandas
+scikit-learn
+# يمكنك إضافة transformers لاحقاً إذا أردت
+REQ
+  cat > "$AI_DIR/runner.py" <<'PY'
+#!/usr/bin/env python3
+import os, json, time
+print("[AI] runner start")
+target = os.environ.get("SKY_TARGET","example.com")
+mode = os.environ.get("SKY_MODE","dry")
+print(f"[AI] target={target} mode={mode}")
+# placeholder: تحليل بسيط
+time.sleep(1)
+with open("/tmp/ai_result.json","w") as f:
+    json.dump({"ok":True,"target":target,"mode":mode}, f)
+print("[AI] runner done -> /tmp/ai_result.json")
+PY
+  chmod +x "$AI_DIR/runner.py"
+fi
+
+# ==== أرشفة AI Engine ورفعه إلى S3 ====
+TMP_BUILD="$(mktemp -d)"
+trap 'rm -rf "$TMP_BUILD" || true' EXIT
+cp -r "$AI_DIR" "$TMP_BUILD/ai_engine"
+tar czf "$TMP_BUILD/$AI_TARBALL" -C "$TMP_BUILD" ai_engine
+log "رفع $AI_TARBALL إلى s3://$BUCKET/$AI_KEY_PREFIX/$AI_TARBALL"
+aws s3 cp "$TMP_BUILD/$AI_TARBALL" "s3://$BUCKET/$AI_KEY_PREFIX/$AI_TARBALL" --region "$REGION" >/dev/null
+
+# ==== تحضير sky.sh أيضاً على S3 مع رابط موقّت ====
+log "رفع sky.sh إلى s3://$BUCKET/core/legacy/sky.sh"
+aws s3 cp "$LEGACY_SKY" "s3://$BUCKET/core/legacy/sky.sh" --region "$REGION" >/dev/null
+PRESIGNED_SKY="$(aws s3 presign "s3://$BUCKET/core/legacy/sky.sh" --region "$REGION" --expires-in 3600)"
+
+# ==== احضار SG و AMI ====
+SG_ID="$(aws ec2 describe-security-groups --region "$REGION" --filters "Name=group-name,Values=$SG_NAME" --query 'SecurityGroups[0].GroupId' --output text 2>/dev/null || true)"
+[ -n "$SG_ID" ] || die "لم أجد Security Group باسم $SG_NAME"
+AMI_ID="$(aws ec2 describe-images --region "$REGION" --owners amazon --filters "Name=name,Values=amzn2-ami-hvm-*-x86_64-gp2" "Name=state,Values=available" \
+  --query 'reverse(sort_by(Images,&CreationDate))[0].ImageId' --output text)"
+[ "$AMI_ID" != "None" ] || die "لم أجد AMI مناسب"
+
+# ==== هل يوجد Instance AI شغال؟ ====
+EXISTING_ID="$(aws ec2 describe-instances --region "$REGION" --filters "Name=tag:Name,Values=$TAG_NAME" "Name=instance-state-name,Values=running" \
+  --query 'Reservations[].Instances[].InstanceId' --output text 2>/dev/null || true)"
+if [ -n "$EXISTING_ID" ]; then
+  INSTANCE_ID="$EXISTING_ID"
+  log "استخدام instance شغال: $INSTANCE_ID"
+else
+  log "تشغيل Spot instance جديد لعقدة AI..."
+  INSTANCE_ID="$(aws ec2 run-instances \
+    --region "$REGION" \
+    --image-id "$AMI_ID" \
+    --instance-type "$INSTANCE_TYPE" \
+    --iam-instance-profile "Name=$PROFILE_NAME" \
+    --security-group-ids "$SG_ID" \
+    --key-name "$KEYPAIR_NAME" \
+    --instance-market-options 'MarketType=spot,SpotOptions={SpotInstanceType=one-time,InstanceInterruptionBehavior=terminate}' \
+    --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=$TAG_NAME},{Key=project,Value=$PROJECT_TAG}]" \
+    --query 'Instances[0].InstanceId' \
+    --output text)"
+  log "تم إطلاق instance: $INSTANCE_ID (Spot)"
+  log "انتظار الحالة running..."
+  aws ec2 wait instance-running --region "$REGION" --instance-ids "$INSTANCE_ID"
+fi
+
+# ==== إرسال أمر SSM لتثبيت المتطلبات وتشغيل المهمة ====
+log "إرسال أمر SSM لتجهيز بيئة AI وتشغيل مهمة تجريبية + تشغيل sky.sh (mode=$RUN_MODE)..."
+
+PARAMS_FILE="$(mktemp)"
+cat > "$PARAMS_FILE" <<EOF
+{
+  "commands": [
+    "set -euo pipefail",
+    "export HOME=/root",
+    "echo '== AI node bootstrap ==' ",
+    "sudo yum -y install python3 python3-pip tar gzip curl >/dev/null 2>&1 || true",
+    "python3 -m pip install --upgrade pip >/dev/null 2>&1 || true",
+
+    "# حمل ai_engine",
+    "mkdir -p /opt/sky_ai && cd /opt/sky_ai",
+    "aws s3 cp s3://$BUCKET/$AI_KEY_PREFIX/$AI_TARBALL /opt/sky_ai/$AI_TARBALL --region $REGION || { echo 'S3 cp failed'; exit 12; }",
+    "tar xzf $AI_TARBALL",
+    "cd ai_engine",
+    "python3 -m pip install -r requirements.txt >/dev/null 2>&1 || true",
+
+    "# حمل sky.sh برابط موقّت",
+    "mkdir -p /opt/sky && cd /opt/sky",
+    "curl -fsSL '$PRESIGNED_SKY' -o sky.sh || { echo 'curl sky.sh failed'; exit 13; }",
+    "chmod +x sky.sh",
+
+    "# شغل sky.sh (dry-run افتراضياً) وخزن المخرجات",
+    "mkdir -p /tmp/sky_out",
+    "if [ '$RUN_MODE' = 'active' ]; then EXTRA=--active; else EXTRA=--dry-run; fi",
+    "timeout 3600 /opt/sky/sky.sh -t '$TARGET' \$EXTRA --outbase /tmp/sky_out || echo 'sky.sh non-zero (قد يكون عادي)'",
+
+    "# شغل AI Engine على المخرجات (placeholder)",
+    "cd /opt/sky_ai/ai_engine",
+    "export SKY_TARGET='$TARGET'; export SKY_MODE='$RUN_MODE'",
+    "python3 runner.py || true",
+
+    "# أرشف النتائج وارفعها إلى S3 (يتطلب PutObject بالدور)",
+    "cd /tmp",
+    "tar czf sky_ai_bundle.tar.gz sky_out || true",
+    "aws s3 cp /tmp/sky_ai_bundle.tar.gz s3://$BUCKET/results/\$(hostname)_\$(date -u +%Y%m%dT%H%M%SZ)_ai.tar.gz --region $REGION || echo 'upload failed'",
+    "echo '== DONE ==' " 
+  ]
+}
+EOF
+
+CMD_ID="$(aws ssm send-command \
+  --region "$REGION" \
+  --instance-ids "$INSTANCE_ID" \
+  --document-name 'AWS-RunShellScript' \
+  --parameters "file://$PARAMS_FILE" \
+  --comment "Sky AXS AI node bootstrap & run" \
+  --query 'Command.CommandId' \
+  --output text)"
+
+log "SSM CommandId: $CMD_ID"
+sleep 2
+
+# ==== انتظار اكتمال التنفيذ ====
+while true; do
+  STATUS="$(aws ssm list-command-invocations --region "$REGION" --command-id "$CMD_ID" --details \
+    --query 'CommandInvocations[0].Status' --output text 2>/dev/null || true)"
+  [ -n "$STATUS" ] || STATUS="Pending"
+  echo " - SSM status: $STATUS"
+  case "$STATUS" in
+    Success|Failed|Cancelled|TimedOut) break;;
+    *) sleep 4;;
+  esac
+done
+
+# ==== جلب مخرجات SSM (إن توفرت) ====
+STDOUT="$(aws ssm get-command-invocation --region "$REGION" --command-id "$CMD_ID" --instance-id "$INSTANCE_ID" \
+  --query 'StandardOutputContent' --output text 2>/dev/null || true)"
+STDERR="$(aws ssm get-command-invocation --region "$REGION" --command-id "$CMD_ID" --instance-id "$INSTANCE_ID" \
+  --query 'StandardErrorContent' --output text 2>/dev/null || true)"
+
+echo "---- SSM STDOUT ----"
+echo "${STDOUT:-<empty>}"
+echo "---- SSM STDERR ----"
+echo "${STDERR:-<empty>}"
+
+# ==== محاولة استعراض النتائج على S3 ====
+log "Listing s3://$BUCKET/results/"
+aws s3 ls "s3://$BUCKET/results/" --region "$REGION" || echo "[!] لا يمكن عرض النتائج (صلاحيّات أو مجلد فارغ)"
+
+# ==== إنهاء السيرفر لتجنّب التكلفة (اختياري) ====
+if [ "$AUTO_TERMINATE" = "true" ]; then
+  log "Auto-terminate enabled. إنهاء $INSTANCE_ID لتفادي التكلفة"
+  aws ec2 terminate-instances --region "$REGION" --instance-ids "$INSTANCE_ID" >/dev/null || true
+  log "تم إرسال أمر الإنهاء."
+else
+  log "تم ترك الـ instance يعمل (AUTO_TERMINATE=false)."
+fi
+
+log "تم."
+ 
+

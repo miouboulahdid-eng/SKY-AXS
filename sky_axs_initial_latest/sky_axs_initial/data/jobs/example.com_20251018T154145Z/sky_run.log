@@ -1,0 +1,7 @@
+Running: /app/core/legacy/sky.sh -t example.com --outbase /data/jobs/example.com_20251018T154145Z --dry-run
+
+=== STDOUT ===
+done
+
+=== STDERR ===
+

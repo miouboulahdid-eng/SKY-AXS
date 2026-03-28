@@ -1,0 +1,7 @@
+{
+  "name": "ssrf_sim",
+  "type": "SSRF",
+  "risk": "MEDIUM",
+  "description": "Simulated SSRF PoC (safe).",
+  "run": "run.sh"
+}

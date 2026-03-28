@@ -1,0 +1,258 @@
+#!/usr/bin/env python3
+"""
+Sandbox runner — تشغيل PoC داخل حاوية Docker مع bind-mount إلى دليل PoCs على الهَاوست.
+
+مميزات:
+ - يدعم extra مثل: --poc=sql_injection أو --cmd="curl http://..." أو raw (يُشغّل عبر /bin/sh -c).
+ - لا يستخدم docker parameter غير مدعوم (readonly_rootfs) ليتوافق مع إصدارات docker-py الأقدم.
+ - يتعامل مع أنظمة ملفات host للقراءة فقط عبر تشغيل السكربت داخل الحاوية بواسطة sh (fallback).
+ - يكتب نتائج JSON في data/results/*.json
+"""
+import os
+import time
+import json
+import logging
+import uuid
+import shutil
+from pathlib import Path
+from datetime import datetime
+
+try:
+    import docker
+    from docker.errors import NotFound, APIError
+except Exception:
+    docker = None
+
+LOG = logging.getLogger("sandbox.runner")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+
+# تهيئة المسارات والصورة الافتراضية
+DEFAULT_IMAGE = os.environ.get("SANDBOX_IMAGE", "python:3.11-slim")
+# مسار PoCs على الهَاوست — أولاً دليل المشروع/pocs ثم fallback إلى core/sandbox/pocs
+POSSIBLE_POC_DIRS = [
+    os.path.abspath("pocs"),
+    os.path.abspath("core/sandbox/pocs"),
+]
+POCS_HOST_DIR = next((p for p in POSSIBLE_POC_DIRS if os.path.isdir(p)), POSSIBLE_POC_DIRS[0])
+RESULTS_DIR = os.path.abspath(os.environ.get("SANDBOX_RESULTS_DIR", "data/results"))
+os.makedirs(RESULTS_DIR, exist_ok=True)
+
+def _parse_extra(extra: str):
+    """
+    تحليل extra:
+      --poc=name   => {'mode':'poc','poc':'name'}
+      --cmd=...    => {'mode':'cmd','cmd':'...'}
+      else         => {'mode':'cmd','cmd':extra}
+    """
+    if not extra:
+        return {"mode": "cmd", "cmd": 'echo "POC: default stub"'}
+    extra = extra.strip()
+    if extra.startswith("--poc="):
+        return {"mode": "poc", "poc": extra.split("=", 1)[1].strip()}
+    if extra.startswith("--cmd="):
+        return {"mode": "cmd", "cmd": extra.split("=", 1)[1].strip()}
+    return {"mode": "cmd", "cmd": extra}
+
+class SandboxRunner:
+    def __init__(self, image: str = None):
+        self.image = image or DEFAULT_IMAGE
+        if docker is None:
+            raise RuntimeError("docker python package not installed. run: python3 -m pip install docker")
+        self.client = docker.from_env()
+
+    def _locate_poc(self, poc_name: str):
+        """ارجع مسار PoC على الهَاوست أو None"""
+        cand = os.path.join(POCS_HOST_DIR, poc_name)
+        if os.path.isdir(cand):
+            return cand
+        return None
+
+    def _make_tmp_workdir(self, poc_path: str = None):
+        """إنشاء مجلد عمل مؤقت لنقل PoC إن لزم"""
+        tmpdir = Path("/tmp") / f"sandbox_run_{uuid.uuid4().hex}"
+        tmpdir.mkdir(parents=True, exist_ok=True)
+        if poc_path:
+            # انسخ محتوى PoC إلى مجلد مؤقت ليُـمَونت نظيفًا
+            try:
+                shutil.copytree(poc_path, tmpdir / "poc", dirs_exist_ok=True)
+            except Exception:
+                # محاولة نسخ جزئي أو fallback
+                for item in os.listdir(poc_path):
+                    s = os.path.join(poc_path, item)
+                    d = tmpdir / item
+                    try:
+                        if os.path.isdir(s):
+                            shutil.copytree(s, d, dirs_exist_ok=True)
+                        else:
+                            shutil.copy2(s, d)
+                    except Exception:
+                        LOG.debug("could not copy %s -> %s (ignored)", s, d)
+        return str(tmpdir)
+
+    def _cleanup_tmp(self, tmpdir: str):
+        try:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+        except Exception:
+            pass
+
+    def run_in_sandbox(self, target: str, extra: str = "", timeout: int = 30):
+        """
+        تشغيل PoC في حاوية: يعيد (result_path, result_dict)
+        """
+        parsed = _parse_extra(extra)
+        job_id = uuid.uuid4().hex[:12]
+        start_ts = datetime.utcnow().isoformat()
+        tmp_workdir = None
+        pobind = None
+
+        # حدد الأمر داخل الحاوية
+        if parsed["mode"] == "poc":
+            poc_name = parsed["poc"]
+            poc_path = self._locate_poc(poc_name)
+            if not poc_path:
+                raise FileNotFoundError(f"PoC not found: {os.path.join(POCS_HOST_DIR, poc_name)}")
+            tmp_workdir = self._make_tmp_workdir(poc_path)
+            # داخل الحاوية سنقوم بتشغيل سكربت run.sh من /run_poc/run.sh
+            container_cmd = "/bin/sh -c 'if [ -x /run_poc/run.sh ]; then /run_poc/run.sh; else sh /run_poc/run.sh; fi'"
+            # ضع mount من tmp_workdir -> /run_poc داخل الحاوية
+            bind_mounts = {tmp_workdir: {"bind": "/run_poc", "mode": "rw"}}
+        else:
+            # mode == cmd
+            cmd = parsed["cmd"]
+            # شغّل الأمر مباشرة عبر sh داخل الحاوية
+            container_cmd = f"/bin/sh -c {json.dumps(cmd)}"
+            bind_mounts = {}
+
+        # نتائج أولية
+        result = {
+            "job_id": job_id,
+            "target": target,
+            "extra": extra,
+            "status": "error",
+            "timestamp": start_ts,
+            "container": None,
+            "output": "",
+            "exit_code": None,
+            "notes": [],
+        }
+
+        image = self.image
+        LOG.info("Pulling image (if needed): %s", image)
+        try:
+            self.client.images.pull(image)
+        except Exception:
+            LOG.debug("pull image failed or already present", exc_info=True)
+
+        container_name = f"axs_sandbox_{job_id}"
+        create_kwargs = {
+            "image": image,
+            "name": container_name,
+            "command": container_cmd if isinstance(container_cmd, list) else ["/bin/sh", "-c", container_cmd],
+            "detach": True,
+            "network_disabled": True,
+            # لا تستخدم readonly_rootfs هنا لتجنّب الأخطاء مع مكتبات docker القديمة
+            "volumes": bind_mounts,
+            "security_opt": ["no-new-privileges"],
+            "cap_drop": ["ALL"],
+            "mem_limit": "256m",
+            "pids_limit": 64,
+            "stdin_open": False,
+            "tty": False,
+        }
+
+        LOG.info("Creating container %s", container_name)
+        try:
+            container = self.client.containers.create(**create_kwargs)
+        except TypeError as te:
+            # إذا واجهت unexpected kwarg حاول حذف أي حقول غير مدعومة تدريجياً
+            LOG.warning("container.create TypeError: %s", te)
+            # محاولة ثانية بدون cap/settings المتقدمة
+            fallback = create_kwargs.copy()
+            for k in ("security_opt", "cap_drop", "mem_limit", "pids_limit"):
+                fallback.pop(k, None)
+            container = self.client.containers.create(**fallback)
+        except APIError as ae:
+            raise
+
+        result["container"] = container_name
+
+        try:
+            LOG.info("Starting container %s", container_name)
+            container.start()
+
+            # انتظر انتهاء أو انتهاء المهلة
+            waited = 0
+            poll_interval = 0.5
+            finished = False
+            while waited < timeout:
+                container.reload()
+                st = container.status
+                # إذا الحاوية توقفت -> انتهت المهمة
+                if st in ("exited", "dead", "created"):
+                    finished = True
+                    break
+                time.sleep(poll_interval)
+                waited += poll_interval
+
+            # إذا لا تزال تعمل بعد المهلة فنوقفها
+            if not finished:
+                LOG.info("Container did not finish within timeout (%s s) — stopping", timeout)
+                try:
+                    container.stop(timeout=2)
+                except Exception:
+                    pass
+
+            # جمع اللوج
+            try:
+                logs = container.logs(stdout=True, stderr=True, tail=10000).decode(errors="ignore")
+            except Exception:
+                logs = "<no logs>"
+
+            exit_code = None
+            try:
+                exit_code = container.wait(timeout=2).get("StatusCode", None)
+            except Exception:
+                try:
+                    exit_code = container.attrs.get("State", {}).get("ExitCode", None)
+                except Exception:
+                    exit_code = None
+
+            result["output"] = logs
+            result["exit_code"] = exit_code
+            result["status"] = "ok" if exit_code == 0 else "failed"
+            result["timestamp_end"] = datetime.utcnow().isoformat()
+
+            # اكتب ملف النتيجة
+            fname = os.path.join(RESULTS_DIR, f"{target.replace(':','_').replace('/','_')}_{int(time.time())}_{job_id}.json")
+            with open(fname, "w") as fh:
+                json.dump(result, fh, indent=2, ensure_ascii=False)
+            LOG.info("Wrote sandbox result to: %s", fname)
+            return fname, result
+
+        finally:
+            # تنظيف: إزالة الحاوية ما أمكن
+            try:
+                container.remove(force=True)
+            except Exception:
+                pass
+            # تنظيف tmp
+            if tmp_workdir:
+                self._cleanup_tmp(tmp_workdir)
+
+# واجهة سطر الأوامر صغيرة للاختبارات
+if __name__ == "__main__":
+    import argparse
+    p = argparse.ArgumentParser(description="Sandbox runner CLI")
+    p.add_argument("target")
+    p.add_argument("--extra", "-e", default="")
+    p.add_argument("--timeout", "-t", type=int, default=30)
+    args = p.parse_args()
+
+    runner = SandboxRunner()
+    try:
+        path, res = runner.run_in_sandbox(args.target, extra=args.extra, timeout=args.timeout)
+        print("Result JSON:", path)
+        print(json.dumps(res, indent=2))
+    except Exception as exc:
+        LOG.exception("Sandbox run failed: %s", exc)
+        raise

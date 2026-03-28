@@ -1,0 +1,2 @@
+/data/jobs/example.com_20251020T190003Z/example.com_20251020T190003Z/raw/interesting_urls.txt:1:https://example.com/.env
+/data/jobs/example.com_20251020T190003Z/example.com_20251020T190003Z/raw/interesting_urls.txt:2:https://example.com/.git

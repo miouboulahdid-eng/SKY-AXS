@@ -1,0 +1,7 @@
+{
+  "name": "xss_reflected_sim",
+  "type": "XSS",
+  "risk": "MEDIUM",
+  "description": "Simulated reflected XSS PoC (safe).",
+  "run": "run.sh"
+}

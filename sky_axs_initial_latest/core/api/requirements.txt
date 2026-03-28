@@ -1,0 +1,13 @@
+fastapi
+uvicorn
+requests
+numpy
+pandas
+joblib
+scikit-learn
+scipy
+aiohttp
+tenacity
+redis
+rq
+boto3

@@ -1,0 +1,7 @@
+{
+  "name": "cmd_injection_sim",
+  "type": "CMD_INJECTION",
+  "risk": "HIGH",
+  "description": "Simulated command injection PoC (safe).",
+  "run": "run.sh"
+}

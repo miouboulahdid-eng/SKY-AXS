@@ -1,0 +1,9 @@
+FROM python:3.11-slim
+WORKDIR /app
+RUN apt-get update -y && apt-get install -y --no-install-recommends curl ca-certificates && apt-get clean && rm -rf /var/lib/apt/lists/*
+# نسخة خفيفة: فقط لتشغيل سكربتات sh (POSIX)
+COPY core /app/core
+COPY pocs /app/pocs
+ENV AXS_RESULTS_DIR=/app/data/results
+RUN mkdir -p /app/data/results
+CMD ["python3", "-c", "from core.sandbox import runner; print('sandbox image ready')"]

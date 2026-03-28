@@ -1,0 +1,6 @@
+fastapi
+numpy
+rq
+redis
+requests
+python-dotenv

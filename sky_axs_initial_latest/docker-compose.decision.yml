@@ -1,0 +1,37 @@
+services:
+  decision-api:
+    build:
+      context: .
+      dockerfile: core/decision/Dockerfile
+    image: sky_axs_initial-decision-api
+    container_name: sky_axs_initial-decision-api
+    environment:
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - RQ_QUEUE=decision
+      - PORT=8083
+    ports:
+      - "8083:8083"
+    networks:
+      - axs_net
+    restart: unless-stopped
+
+  decision-worker:
+    build:
+      context: .
+      dockerfile: core/decision/Dockerfile.worker
+    image: sky_axs_initial-decision-worker
+    container_name: sky_axs_initial-decision-worker
+    environment:
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - RQ_QUEUE=decision
+    command: python core/decision/worker.py
+    networks:
+      - axs_net
+    restart: unless-stopped
+
+networks:
+  axs_net:
+    external: true
+    name: sky_axs_initial_default

@@ -1,0 +1,26 @@
+{
+  "job_id": "786225ccd62246b9a860b1ae409cc245",
+  "target": "https://example.com",
+  "extra": "--notes=test",
+  "status": "ok",
+  "started": "2025-11-05T23:32:34.534000",
+  "output": {
+    "status_code": 200,
+    "headers": {
+      "Accept-Ranges": "bytes",
+      "Content-Type": "text/html",
+      "ETag": "\"bc2473a18e003bdb249eba5ce893033f:1760028122.592274\"",
+      "Last-Modified": "Thu, 09 Oct 2025 16:42:02 GMT",
+      "Vary": "Accept-Encoding",
+      "Content-Encoding": "gzip",
+      "Content-Length": "363",
+      "Cache-Control": "max-age=86000",
+      "Date": "Wed, 05 Nov 2025 23:32:34 GMT",
+      "Connection": "keep-alive",
+      "Alt-Svc": "h3=\":443\"; ma=93600"
+    },
+    "body_snippet": "<!doctype html><html lang=\"en\"><head><title>Example Domain</title><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><style>body{background:#eee;width:60vw;margin:15vh auto;font-family:system-ui,sans-serif}h1{font-size:1.5em}div{opacity:0.8}a:link,a:visited{color:#348}</style><body><div><h1>Example Domain</h1><p>This domain is for use in documentation examples without needing permission. Avoid use in operations.<p><a href=\"https://iana.org/domains/example\">Learn more</a></div></"
+  },
+  "notes": [],
+  "ended": "2025-11-05T23:32:35.066004"
+}

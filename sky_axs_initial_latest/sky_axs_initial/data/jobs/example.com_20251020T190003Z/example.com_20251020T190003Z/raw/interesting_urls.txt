@@ -1,0 +1,4 @@
+https://example.com/.env
+https://example.com/.git
+https://example.com/admin
+https://example.com/login

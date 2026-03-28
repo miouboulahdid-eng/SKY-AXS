@@ -1,0 +1,50 @@
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
+import uuid
+import os
+import json
+import redis
+from rq import Queue
+
+# إعداد Redis
+REDIS_HOST = os.getenv("REDIS_HOST", "sky_axs_initial-redis")
+REDIS_PORT = int(os.getenv("REDIS_PORT", "6379"))
+DATA_DIR = "/app/data"
+DECISIONS_DIR = os.path.join(DATA_DIR, "mobile_decisions")
+os.makedirs(DECISIONS_DIR, exist_ok=True)
+
+# الاتصال بـ Redis
+rconn = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, db=0, decode_responses=True)
+q = Queue(os.getenv("MOBILE_QUEUE", "mobile"), connection=rconn)
+
+app = FastAPI(title="AXS Mobile API", version="0.1")
+
+class ScanRequest(BaseModel):
+    target: str
+    extra: str = ""
+
+@app.get("/health")
+def health():
+    try:
+        rconn.ping()
+        return {"status": "ok", "redis": True}
+    except Exception:
+        return {"status": "degraded", "redis": False}
+
+@app.post("/scan")
+def scan(req: ScanRequest):
+    if not req.target:
+        raise HTTPException(status_code=400, detail="Missing target")
+
+    job_id = str(uuid.uuid4())
+    q.enqueue("core.mobile.worker.run_mobile_scan", req.target, req.extra, job_id=job_id, ttl=3600)
+
+    return {"status": "queued", "job_id": job_id}
+
+@app.get("/result/{job_id}")
+def result(job_id: str):
+    path = os.path.join(DECISIONS_DIR, f"{job_id}.json")
+    if not os.path.exists(path):
+        return {"status": "pending", "job_id": job_id}
+    with open(path, "r") as f:
+        return json.load(f)

@@ -1,0 +1,7 @@
+{
+  "name": "mobile_api_config_sim",
+  "type": "MOBILE_API",
+  "risk": "MEDIUM",
+  "description": "Simulated mobile API misconfiguration PoC (safe).",
+  "run": "run.sh"
+}

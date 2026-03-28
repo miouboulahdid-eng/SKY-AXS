@@ -1,0 +1,47 @@
+import os
+import time
+import json
+import logging
+import redis
+from rq import Worker, Queue
+from redis import Redis
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+
+REDIS_HOST = os.environ.get("REDIS_HOST", "redis")
+REDIS_PORT = int(os.environ.get("REDIS_PORT", "6379"))
+DATA_DIR = "/app/data"
+DECISIONS_DIR = os.path.join(DATA_DIR, "mobile_decisions")
+os.makedirs(DECISIONS_DIR, exist_ok=True)
+
+def run_mobile_scan(target: str, extra: str = "", job_id: str = None):
+    """
+    المهمة التي تنفّذ فحص الموبايل (POC / stub).
+    يجب استبدال المنطق هنا بآليات حقيقية (apktool, emulator, frida) لاحقًا.
+    تحفظ نتيجة json في /app/data/mobile_decisions/<job_id>.json
+    """
+    logging.info("Received mobile scan task for target=%s extra=%s", target, extra)
+    if job_id is None:
+        job_id = str(int(time.time()))
+    result = {
+        "target": target,
+        "extra": extra,
+        "status": "OK",
+        "notes": "stub mobile scan — replace with real engine",
+        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime())
+    }
+    out_path = os.path.join(DECISIONS_DIR, f"{job_id}.json")
+    with open(out_path, "w") as f:
+        json.dump({"status":"finished","job_id":job_id,"result":result}, f)
+    logging.info("Wrote mobile decision to %s", out_path)
+    return result
+
+def start_worker():
+    redis_conn = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, db=0)
+    with Connection(redis_conn):
+        q = Queue("mobile")
+        worker = Worker([q])
+        worker.work(with_scheduler=False)
+
+if __name__ == "__main__":
+    start_worker()

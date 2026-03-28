@@ -1,0 +1,49 @@
+{
+  "target": "https://example.com",
+  "strategy": [
+    "sql_injection"
+  ],
+  "extra": "--dry-run",
+  "started_at": "2025-11-06T16:34:29.359280",
+  "ended_at": "2025-11-06T16:34:33.218401",
+  "results": [
+    {
+      "poc": "sql_injection",
+      "status": "ok",
+      "result": {
+        "job_id": "4202d6bb0fc3",
+        "target": "https://example.com",
+        "poc_extra": "--dry-run --poc=sql_injection",
+        "status": "ok",
+        "confidence": 0.05,
+        "votes": [
+          "no_issue",
+          "no_issue"
+        ],
+        "attempts": [
+          {
+            "attempt_id": "8435fb93b903",
+            "container": "axs_sandbox_8435fb93b903",
+            "exit_code": 2,
+            "output": "./run.sh: 2: .: cannot open ./_poc_lib.sh: No such file\n",
+            "output_hash": "56d1c7c06976117770beb0ce47ef06b385d26664ff297dea76ebd8387848c687",
+            "duration": 0.425,
+            "attempt": 1
+          },
+          {
+            "attempt_id": "e6fe88d97223",
+            "container": "axs_sandbox_e6fe88d97223",
+            "exit_code": 2,
+            "output": "./run.sh: 2: .: cannot open ./_poc_lib.sh: No such file\n",
+            "output_hash": "56d1c7c06976117770beb0ce47ef06b385d26664ff297dea76ebd8387848c687",
+            "duration": 0.42,
+            "attempt": 2
+          }
+        ],
+        "timestamp": "2025-11-06T16:34:33.215105",
+        "notes": [],
+        "_result_file": "/app/data/results/https_example.com_20251106163433_e1fdc5e29436.json"
+      }
+    }
+  ]
+}

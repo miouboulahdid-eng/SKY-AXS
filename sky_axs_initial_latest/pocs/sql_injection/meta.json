@@ -1,0 +1,7 @@
+{
+  "name": "sql_injection_sim",
+  "type": "SQLi",
+  "risk": "HIGH",
+  "description": "Simulated boolean/error-based SQL injection PoC (safe).",
+  "run": "run.sh"
+}

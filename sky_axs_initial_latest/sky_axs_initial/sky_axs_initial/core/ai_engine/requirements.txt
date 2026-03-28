@@ -1,0 +1,7 @@
+boto3
+requests
+tqdm
+numpy
+pandas
+scikit-learn
+# يمكنك إضافة transformers لاحقاً إذا أردت

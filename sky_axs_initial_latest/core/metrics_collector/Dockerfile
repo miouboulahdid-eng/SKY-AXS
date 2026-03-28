@@ -13,4 +13,4 @@ COPY . .
 
 ENV PYTHONPATH=/app
 
-CMD ["rq", "worker", "-u", "redis://redis:6379", "default"]
+CMD ["python", "core/metrics_collector/collector.py"]

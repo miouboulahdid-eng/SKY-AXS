@@ -1,0 +1,6 @@
+{
+  "target": "example.com",
+  "extra": "--dry-run",
+  "status": "OK",
+  "timestamp": "2026-03-28T16:24:13.128565"
+}

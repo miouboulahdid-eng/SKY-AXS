@@ -1,19 +1,16 @@
 FROM python:3.11-slim
+
 WORKDIR /app
 
-# تثبيت الأدوات الأساسية فقط
-RUN apt-get update -y && \
-    apt-get install -y --no-install-recommends gcc build-essential libffi-dev python3-dev curl && \
-    apt-get clean && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    gcc build-essential curl \
+    && rm -rf /var/lib/apt/lists/*
 
-# نسخ ملف الاعتمادات إلى المسار الصحيح داخل الصورة
-COPY core/orchestrator/requirements.txt /app/requirements.txt
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
 
-# تثبيت جميع الاعتمادات (بما فيها numpy)
-RUN pip install --no-cache-dir -r /app/requirements.txt
+COPY . .
 
-# نسخ باقي ملفات المشروع
-COPY . /app
+ENV PYTHONPATH=/app
 
-# تشغيل orchestrator
-CMD ["python3", "-m", "core.orchestrator.main"]
+CMD ["uvicorn", "core.orchestrator.main:app", "--host", "0.0.0.0", "--port", "8081"]

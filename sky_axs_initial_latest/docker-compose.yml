@@ -80,5 +80,13 @@ services:
       - api
     restart: unless-stopped
 
+  # إضافة Juice Shop
+  juice-shop:
+    image: bkimminich/juice-shop:latest
+    container_name: juice-shop
+    ports:
+      - "3000:3000"
+    restart: unless-stopped
+
 volumes:
   redis_data:

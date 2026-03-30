@@ -36,6 +36,14 @@ class SandboxRequest(BaseModel):
     target: str
     extra: str = ""
 
+class EndpointAnalysisRequest(BaseModel):
+    method: str = "GET"
+    url: str
+    params: Optional[Dict] = {}
+    headers: Optional[Dict] = {}
+    cookies: Optional[Dict] = {}
+    response_body: Optional[str] = ""
+
 # ========== Existing Endpoints ==========
 @app.get("/health")
 def health():
@@ -44,31 +52,22 @@ def health():
 @app.post("/predict")
 def predict(payload: TargetIn):
     """نموذج الذكاء الأساسي (سابقاً)."""
-    result = ai_basic.analyze_target(payload.target)   # <-- غيرنا process إلى analyze_target
+    result = ai_basic.analyze_target(payload.target)
     return {"target": payload.target, "analysis": result, "status": "ok"}
 
 @app.post("/behavior/ingest")
 def behavior_ingest(payload: EventsIn):
-    """
-    تغذية baseline لتعلّم الأنماط (غير مراقَب).
-    مثال حدث: {"target": "sub.example.com", "method":"GET","path":"/a","timestamp":1690000000}
-    """
     info = behavior.ingest(payload.events)
     return {"status": "ok", **info}
 
 @app.post("/behavior/score")
 def behavior_score(payload: EventsIn):
-    """
-    إرجاع درجة الشذوذ لكل حدث.
-    إذا الموديل لم يُدرّب بعد، سيخزن الأحداث كـ baseline ويرجع note.
-    """
     out = behavior.score(payload.events)
     return {"status": "ok", **out}
 
 # ========== New Endpoints ==========
 @app.post("/analyze")
 def analyze_text(req: AnalyzeRequest):
-    """تحليل نص باستخدام محرك AxsAIEngine"""
     try:
         result = ai_basic.analyze_target(req.input_text)
         return {
@@ -82,7 +81,6 @@ def analyze_text(req: AnalyzeRequest):
 
 @app.post("/sandbox/run")
 def sandbox_run(req: SandboxRequest):
-    """إرسال مهمة إلى Sandbox عبر RQ"""
     q = _get_queue()
     job = q.enqueue(
         "core.worker.sandbox_task.sandbox_task_run_in_sandbox",
@@ -96,7 +94,6 @@ def sandbox_run(req: SandboxRequest):
 
 @app.get("/sandbox/result/{job_id}")
 def sandbox_result(job_id: str):
-    """استرجاع نتيجة مهمة Sandbox"""
     q = _get_queue()
     job = q.fetch_job(job_id)
     if not job:
@@ -107,6 +104,22 @@ def sandbox_result(job_id: str):
         "ended_at": str(job.ended_at),
         "result": job.result
     }
+
+@app.post("/analyze/llm")
+def analyze_with_llm(req: EndpointAnalysisRequest):
+    """تحليل endpoint باستخدام LLM لاكتشاف IDOR/BAC"""
+    from core.ai_models.llm_analyzer import analyze_endpoint_with_llm
+    
+    data = {
+        "method": req.method,
+        "url": req.url,
+        "params": req.params,
+        "headers": req.headers,
+        "cookies": req.cookies,
+        "response_body": req.response_body
+    }
+    result = analyze_endpoint_with_llm(data)
+    return result
 
 @app.get("/")
 def root():
